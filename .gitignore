@@ -1,9 +1,9 @@
 .venv/
 __pycache__/
 *.pyc
-output/
-data/
-runs/
-
+/data/*
+!/data/prepare.py
+/runs/
+/output/
 .playwright-cli/
 web/assets/weights.safetensors

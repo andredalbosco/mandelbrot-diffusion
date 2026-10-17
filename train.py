@@ -1,43 +1,402 @@
-"""Train pixel-space image flows on Mandelbrot images or paired 4x zoom views."""
-
+"""Train JiT on full, partial, and absent 4x zoom evidence."""
 import argparse
 import copy
 import csv
 import hashlib
 import json
-from pathlib import Path
+import math
+import runpy
 import time
-
+from pathlib import Path
 import torch
+from torch.nn import functional as F
+from model import build_model
 
-from dataset import load_images, load_zoom_pairs
-from model import RectifiedFlow, XPredictionFlow, build_model
+MODES = ("interior", "edge", "corner", "unconditional")
+
+def save_grid(images, path, columns=8):
+    from PIL import Image
+    images = images.detach().cpu().clamp(0, 1)
+    if images.ndim == 3:
+        images = images[:, None]
+    count, channels, height, width = images.shape
+    columns = min(count, columns)
+    rows = math.ceil(count / columns)
+    canvas = torch.ones((channels, rows * height, columns * width))
+    for index, image in enumerate(images):
+        row, col = divmod(index, columns)
+        canvas[:, row*height:(row+1)*height, col*width:(col+1)*width] = image
+    pixels = (canvas * 255).round().to(torch.uint8)
+    pixels = pixels[0] if channels == 1 else pixels.permute(1, 2, 0)
+    Image.fromarray(pixels.numpy()).save(path)
 
 
-def batch_loss(model, diffusion, batch, generator=None):
-    if isinstance(diffusion, RectifiedFlow):
-        t = torch.rand(len(batch), device=batch.device, generator=generator)
-        return diffusion.loss(model, batch[:, 1], batch[:, 0], t)
-    t = diffusion.times(len(batch), batch.device, generator)
-    noise = torch.randn(batch.shape, device=batch.device, generator=generator)
-    return diffusion.loss(model, batch, t, noise)
+def conditioning_patch_mask(records):
+    """Coverage of parent pixels retained in the 32x32 conditioning crop."""
+    if any(r.get('zoom_factor') != 4 or r.get('crop_size') != 32 or
+           type(r.get('crop_left')) is not int or type(r.get('crop_top')) is not int
+           for r in records):
+        raise ValueError('Patch32 requires integer 32-pixel crops and 4x zoom')
+    x = torch.tensor([r['crop_left'] for r in records])[:, None]+torch.arange(32)
+    y = torch.tensor([r['crop_top'] for r in records])[:, None]+torch.arange(32)
+    present = torch.tensor([r['mode'] != 'unconditional' for r in records])
+    return (((y[:, :, None] >= 0) & (y[:, :, None] < 128) &
+             (x[:, None, :] >= 0) & (x[:, None, :] < 128)) & present[:, None, None])[:, None]
 
 
-@torch.no_grad()
-def validation_loss(model, diffusion, images, batch_size, seed):
-    model.eval()
-    generator = torch.Generator(device=images.device).manual_seed(seed)
-    total = 0.0
-    for clean in images.split(batch_size):
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=isinstance(diffusion, RectifiedFlow)):
-            total += batch_loss(model, diffusion, clean, generator).item() * len(clean)
-    model.train()
-    return total / len(images)
+def reconstruct_conditioning(target, evidence, mask):
+    """Expand normalized compact evidence with clamped crop edges on the GPU."""
+    if evidence.shape[-2:] == target.shape[-2:]:
+        return target, evidence, mask
+    size = target.shape[-2:]
+    weights = F.interpolate(mask, size=size, mode='bilinear', align_corners=False)
+    rgb = F.interpolate(evidence*mask, size=size, mode='bilinear', align_corners=False)
+    rgb = torch.where(weights > 1e-6, rgb/weights.clamp_min(1e-6), 0.)
+    return target, rgb, weights
+
+
+class ZoomDataset:
+    """Memory-map mixed zoom pairs; transfer only selected batches to CUDA."""
+
+    def __init__(self, path):
+        self.data = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        self.inputs, self.targets = self.data['inputs'], self.data['targets']
+        self.records = self.data["records"]
+        self.encoding = self.data.get('encoding', 'float32')
+        if self.encoding == 'uint16-patch32':
+            self.masks = conditioning_patch_mask(self.records).to(torch.int32).mul_(65535).to(torch.uint16)
+        else:
+            self.masks = self.data['masks']
+        if self.encoding not in ('float32', 'uint16-unorm', 'uint16-patch32'):
+            raise ValueError('Unknown zoom tensor encoding')
+        if self.encoding.startswith('uint16-') and any(v.dtype != torch.uint16 for v in (self.inputs, self.targets, self.masks)):
+            raise ValueError('Quantized zoom data requires uint16 tensors')
+        n, c, h, w = self.targets.shape
+        input_shape = (n, 3, 32, 32) if self.encoding == 'uint16-patch32' else self.targets.shape
+        mask_shape = (n, 1, *input_shape[-2:])
+        if self.encoding == 'uint16-patch32' and (h, w) != (128, 128):
+            raise ValueError('Patch32 requires 128x128 targets')
+        if not n or c != 3 or self.inputs.shape != input_shape or self.masks.shape != mask_shape or len(self.records) != n:
+            raise ValueError("Invalid mixed zoom dataset shapes")
+
+    def __len__(self):
+        return len(self.targets)
+
+    def batch(self, indices, device="cuda"):
+        values = [x[indices].to(device=device, dtype=torch.float32) for x in (self.targets, self.inputs, self.masks)]
+        if self.encoding.startswith('uint16-'):
+            values = [v.div_(65535) for v in values]
+        if any(not x.isfinite().all() or x.min() < 0 or x.max() > 1 for x in values):
+            raise ValueError("Dataset values must be finite and in [0,1]")
+        target, evidence, mask = values
+        return reconstruct_conditioning(target*2-1, evidence*2-1, mask)
+
+
+class ShardedZoomDataset:
+    """Manifest-backed metadata and sparse reads for held-out evaluation."""
+
+    def __init__(self, root, split):
+        self.root = Path(root)
+        manifest = json.loads((self.root/'manifest.json').read_text())
+        if not manifest.get('complete'):
+            raise ValueError('Training requires a complete dataset manifest')
+        self.files = [s['files'][split] for s in manifest['shards']]
+        if not self.files or any(item['count'] <= 0 for item in self.files):
+            raise ValueError('Dataset must have nonempty shards')
+        self.ends = []
+        total = 0
+        for item in self.files:
+            total += item['count']
+            self.ends.append(total)
+        self._records = None
+
+    def __len__(self):
+        return self.ends[-1]
+
+    @property
+    def records(self):
+        if self._records is None:
+            self._records = []
+            for item in self.files:
+                data = ZoomDataset(self.root/item['path'])
+                if len(data) != item['count']:
+                    raise ValueError('Shard count differs from manifest')
+                self._records.extend(data.records)
+        return self._records
+
+    def batch(self, indices, device='cuda'):
+        import bisect
+        groups = {}
+        for position, index in enumerate(indices):
+            index = int(index)
+            if not 0 <= index < len(self):
+                raise IndexError(index)
+            shard = bisect.bisect_right(self.ends, index)
+            start = self.ends[shard-1] if shard else 0
+            groups.setdefault(shard, []).append((position, index-start))
+        output = None
+        for shard, pairs in groups.items():
+            positions, local = zip(*pairs)
+            values = ZoomDataset(self.root/self.files[shard]['path']).batch(list(local), device)
+            if output is None:
+                output = [v.new_empty((len(indices), *v.shape[1:])) for v in values]
+            for target, value in zip(output, values):
+                target[list(positions)] = value
+        return tuple(output)
+
+
+def training_order(records, seed, unconditional_fraction=None):
+    """Shuffle a shard; optionally thin modes to a desired unconditional share."""
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(len(records), generator=generator)
+    if unconditional_fraction is None:
+        return order
+    fraction = unconditional_fraction
+    if not 0 <= fraction <= 1:
+        raise ValueError('Unconditional fraction must be in [0,1]')
+    unconditional = torch.tensor([r['mode'] == 'unconditional' for r in records])
+    u, c = order[unconditional[order]], order[~unconditional[order]]
+    if fraction == 0:
+        return c
+    if fraction == 1:
+        return u
+    if not len(u) or not len(c):
+        raise ValueError('Requested mix requires both conditional and unconditional examples')
+    if len(u)/len(records) > fraction:
+        u = u[:round(len(c)*fraction/(1-fraction))]
+    else:
+        c = c[:round(len(u)*(1-fraction)/fraction)]
+    selected = torch.cat((c, u))
+    return selected[torch.randperm(len(selected), generator=generator)]
+
+
+class ShardBatches:
+    """Shuffle shards and their rows; prefetch one shard while CUDA trains.
+
+    The current and prefetched normalized float32 shards live on the GPU. Pinned CPU staging retains
+    exact source values; no quantization or dataset rewriting. Batches crossing
+    shard/epoch boundaries are joined, so no examples are dropped. State refers
+    to consumed rows, never prefetched rows, making checkpoint resume exact.
+    """
+
+    def __init__(self, root, batch_size, seed, device='cuda', state=None, unconditional_fraction=None,
+                 select_rows=False, staging_rows=0):
+        from concurrent.futures import ThreadPoolExecutor
+        self.dataset = ShardedZoomDataset(root, 'train')
+        if unconditional_fraction is not None and not 0 <= unconditional_fraction <= 1:
+            raise ValueError('Unconditional fraction must be in [0,1]')
+        self.unconditional_fraction = unconditional_fraction
+        self.select_rows = select_rows
+        if type(staging_rows) is not int or staging_rows < 0:
+            raise ValueError("Staging rows must be nonnegative")
+        self.staging_rows = staging_rows
+        self.staging_events = [None, None]
+        if batch_size <= 0:
+            raise ValueError('Batch size must be positive')
+        self.batch_size, self.seed, self.device = batch_size, seed, torch.device(device)
+        self.epoch, self.shard_cursor, self.offset = 0, 0, 0
+        if state:
+            self.epoch, self.shard_cursor, self.offset = (state[k] for k in ('epoch', 'shard_cursor', 'offset'))
+        if self.epoch < 0 or not 0 <= self.shard_cursor < len(self.dataset.files):
+            raise ValueError('Invalid sampler cursor')
+        count = self.dataset.files[self._key()[1]]['count']
+        if not 0 <= self.offset < count:
+            raise ValueError('Invalid sampler offset')
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='zoom-prefetch')
+        self.values = None
+        self.loaded_key = None
+        self.validated = set()
+        self.staging = [None, None]
+        self.read_index = 0
+        self.read_timings = []
+        self.copy_stream = torch.cuda.Stream(device=self.device) if self.device.type == 'cuda' else None
+        self.future = self.pool.submit(self._read, self._key())
+        self.future_key = self._key()
+        self.load_seconds = 0.
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _order(self, epoch):
+        generator = torch.Generator().manual_seed(self.seed+epoch)
+        return torch.randperm(len(self.dataset.files), generator=generator).tolist()
+
+    def _key(self):
+        return self.epoch, self._order(self.epoch)[self.shard_cursor]
+
+    def _next_key(self):
+        cursor, epoch = self.shard_cursor+1, self.epoch
+        if cursor == len(self.dataset.files):
+            cursor, epoch = 0, epoch+1
+        return epoch, self._order(epoch)[cursor]
+
+    def _read(self, key):
+        shard = key[1]
+        item = self.dataset.files[shard]
+        data = ZoomDataset(self.dataset.root/item['path'])
+        if len(data) != item['count']:
+            raise ValueError('Shard count differs from manifest')
+        start = time.perf_counter()
+        source = (data.targets, data.inputs, data.masks)
+        order = training_order(data.records, self.seed+1000003*(key[0]+1)+key[1],
+                               self.unconditional_fraction)
+        if not len(order):
+            raise ValueError('Training mixture selected no rows')
+        selected = None
+        if self.select_rows and len(order) < len(data):
+            # Read selected rows in file order, retaining the original shuffle.
+            selected, permutation = order.sort()
+            order = permutation.argsort()
+        shapes = [(len(selected) if selected is not None else len(v), *v.shape[1:]) for v in source]
+        from contextlib import nullcontext
+        context = torch.cuda.stream(self.copy_stream) if self.copy_stream is not None else nullcontext()
+        with context:
+            if self.staging_rows:
+                gpu = self._stage_chunks(source, selected, shapes)
+            else:
+                slot = self.read_index % 2
+                self.read_index += 1
+                values = self.staging[slot]
+                if values is None or any(a.shape != shape or a.dtype != v.dtype for a, shape, v in zip(values, shapes, source)):
+                    values = [torch.empty(shape, dtype=v.dtype, pin_memory=self.device.type == 'cuda') for v, shape in zip(source, shapes)]
+                    self.staging[slot] = values
+                for destination, value in zip(values, source):
+                    if selected is None:
+                        destination.copy_(value)
+                    else:
+                        if value.dtype == torch.uint16:
+                            torch.index_select(value.view(torch.int16), 0, selected, out=destination.view(torch.int16))
+                        else:
+                            torch.index_select(value, 0, selected, out=destination)
+                gpu = tuple(v.to(self.device, non_blocking=True) if self.device.type == 'cuda' else v.clone() for v in values)
+            if data.encoding.startswith('uint16-'):
+                gpu = tuple(v.float().div_(65535) for v in gpu)
+            copied = time.perf_counter()
+            self.read_timings.append(dict(shard=shard, staging_enqueue=copied-start))
+            if selected is not None or shard not in self.validated:
+                for value in gpu:
+                    low, high = torch.aminmax(value)
+                    if not (low >= 0 and high <= 1):
+                        raise ValueError('Dataset values must be finite and in [0,1]')
+                self.validated.add(shard)
+            for value in gpu[:2]:
+                value.mul_(2).sub_(1)
+        if self.copy_stream is not None:
+            self.copy_stream.synchronize()
+        self.read_timings[-1]['transfer_validate_normalize'] = time.perf_counter()-copied
+        return gpu, order
+
+    def _stage_chunks(self, source, selected, shapes):
+        """Overlap sequential CPU reads with H2D using two event-protected slots.
+
+        Full GPU shards retain random row access; only host staging is chunked.
+        Events guard pinned source reuse, not consumer tensor lifetime.
+        """
+        cuda = self.device.type == 'cuda'
+        gpu = tuple(torch.empty(shape, dtype=v.dtype, device=self.device) for v, shape in zip(source, shapes))
+        for begin in range(0, shapes[0][0], self.staging_rows):
+            end = min(begin+self.staging_rows, shapes[0][0])
+            slot = self.read_index % 2
+            self.read_index += 1
+            if self.staging_events[slot] is not None:
+                self.staging_events[slot].synchronize()
+            needed = [(self.staging_rows, *v.shape[1:]) for v in source]
+            buffers = self.staging[slot]
+            if buffers is None or any(buf.shape != shape or buf.dtype != value.dtype for buf, shape, value in zip(buffers, needed, source)):
+                buffers = [torch.empty(shape, dtype=v.dtype, pin_memory=cuda) for v, shape in zip(source, needed)]
+                self.staging[slot] = buffers
+            for target, buf, value in zip(gpu, buffers, source):
+                host = buf[:end-begin]
+                if selected is None:
+                    host.copy_(value[begin:end])
+                else:
+                    if value.dtype == torch.uint16:
+                        torch.index_select(value.view(torch.int16), 0, selected[begin:end], out=host.view(torch.int16))
+                    else:
+                        torch.index_select(value, 0, selected[begin:end], out=host)
+                target[begin:end].copy_(host, non_blocking=cuda)
+            if cuda:
+                if self.staging_events[slot] is None:
+                    self.staging_events[slot] = torch.cuda.Event()
+                self.staging_events[slot].record(self.copy_stream)
+        return gpu
+
+    def _load(self):
+        key = self._key()
+        if self.loaded_key == key:
+            return
+        start = time.perf_counter()
+        if self.future_key != key:
+            raise RuntimeError('Prefetch cursor disagrees with consumed data')
+        self.values, order = self.future.result()
+        if self.device.type == 'cuda':
+            for value in self.values:
+                value.record_stream(torch.cuda.current_stream(self.device))
+        self.indices = order.to(self.device)
+        if self.offset >= len(self.indices):
+            raise ValueError('Sampler offset exceeds selected shard rows')
+        self.loaded_key = key
+        self.future_key = self._next_key()
+        self.future = self.pool.submit(self._read, self.future_key)
+        self.load_seconds += time.perf_counter()-start
+
+    def __next__(self):
+        remaining, pieces = self.batch_size, []
+        while remaining:
+            self._load()
+            count = min(remaining, len(self.indices)-self.offset)
+            ids = self.indices[self.offset:self.offset+count]
+            pieces.append(reconstruct_conditioning(*(v[ids] for v in self.values)))
+            self.offset += count
+            remaining -= count
+            if self.offset == len(self.indices):
+                self.offset = 0
+                self.shard_cursor += 1
+                if self.shard_cursor == len(self.dataset.files):
+                    self.shard_cursor = 0
+                    self.epoch += 1
+        if len(pieces) == 1:
+            return pieces[0]
+        return tuple(torch.cat([piece[i] for piece in pieces]) for i in range(3))
+
+    def state_dict(self):
+        return dict(epoch=self.epoch, shard_cursor=self.shard_cursor, offset=self.offset)
+
+    def close(self):
+        self.pool.shutdown(wait=True, cancel_futures=True)
+        self.future = None
+        self.values = None
+        self.staging = [None, None]
+        self.staging_events = [None, None]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def select_views(records, per_mode=64, seed=17):
+    generator = torch.Generator().manual_seed(seed)
+    result = []
+    for mode in MODES:
+        buckets = {}
+        for i, record in enumerate(records):
+            if record['mode'] == mode:
+                buckets.setdefault(record['zoom_depth'], []).append(i)
+        for depth, ids in buckets.items():
+            buckets[depth] = [ids[i] for i in torch.randperm(len(ids), generator=generator).tolist()]
+        chosen = []
+        while len(chosen) < per_mode and any(buckets.values()):
+            for depth in sorted(buckets):
+                if buckets[depth] and len(chosen) < per_mode:
+                    chosen.append(buckets[depth].pop())
+        result.extend(chosen)
+    return result
 
 
 def train_masked(config, resume=None, max_seconds=None):
     """Train one clean-image JiT on full, partial, and absent evidence."""
-    from dataset import ZoomDataset, ShardedZoomDataset, ShardBatches, save_grid
     from model import ConditionalFlow
 
     torch.set_num_threads(4)
@@ -107,12 +466,11 @@ def train_masked(config, resume=None, max_seconds=None):
         # Fixed evaluation selection, optionally balanced over both mode and depth.
         modes = ('interior', 'edge', 'corner', 'unconditional')
         if config.get('stratify_depth', False):
-            from scripts.evaluate_training import select_views
             validation_ids = select_views(val.records, per_mode=64, seed=config['seed']+1)
             preview_ids = []
             for mode in modes:
                 chosen = [i for i in validation_ids if val.records[i]['mode'] == mode]
-                preview_ids.extend(chosen[j] for j in (0, 16, 32, 48))
+                preview_ids.extend(chosen[::max(1, len(chosen)//4)][:4])
         else:
             rng = torch.Generator().manual_seed(config['seed']+1)
             validation_ids, preview_ids = [], []
@@ -152,7 +510,7 @@ def train_masked(config, resume=None, max_seconds=None):
             clean,evidence,mask=preview_batch
             with torch.autocast('cuda',dtype=torch.bfloat16):
                 one=flow.sample(ema,evidence,mask,steps=1,seed=config['seed']+3)
-                multi=flow.sample(ema,evidence,mask,steps=16,seed=config['seed']+3)
+                multi=flow.sample(ema,evidence,mask,steps=50,solver="heun",seed=config['seed']+3)
             target=(clean+1)/2
             panels=torch.stack([(evidence[i]+1)/2 if col==0 else mask[i].expand(3,-1,-1) if col==1
                                 else one[i] if col==2 else multi[i] if col==3 else target[i]
@@ -162,12 +520,12 @@ def train_masked(config, resume=None, max_seconds=None):
             latest.write_bytes((output/f'preview-{step:06d}.png').read_bytes())
             latest.replace(output/'preview-latest.png')
             scores={}
-            for i,mode in enumerate(modes):
-                begin=i*4;end=begin+4
-                if end<=len(target):
-                    scores[mode]={'one_step_mse':(one[begin:end]-target[begin:end]).square().mean().item(),
-                                  'sixteen_step_mse':(multi[begin:end]-target[begin:end]).square().mean().item()}
-            (output/f'preview-{step:06d}.json').write_text(json.dumps({'columns':['input','mask','one step','16 steps','target'],
+            for mode in modes:
+                ids = [i for i, row in enumerate(preview_ids) if val.records[row]['mode'] == mode]
+                if ids:
+                    scores[mode] = {'one_step_mse': (one[ids]-target[ids]).square().mean().item(),
+                                    'heun50_mse': (multi[ids]-target[ids]).square().mean().item()}
+            (output/f'preview-{step:06d}.json').write_text(json.dumps({'columns':['input','mask','one step','50-step Heun','target'],
                      'validation_ids':preview_ids,'scores':scores,'note':'Fixed examples; pixel MSE is not a distribution-quality metric for unconditional generation.'},indent=2)+'\n')
             return scores
 
@@ -211,13 +569,6 @@ def train_masked(config, resume=None, max_seconds=None):
                     val_loss=evaluate(model);ema_loss=evaluate(ema)
                     preview(step)
                     print(f'step={step} train={loss.item():.6f} val={val_loss:.6f} ema_val={ema_loss:.6f}',flush=True)
-                if step in config.get('quality_steps', []):
-                    from scripts.evaluate_training import quality_report
-                    gallery = Path(config['quality_output'])
-                    quality_report(ema, flow, val, gallery, 'validation', step, seed=config['seed']+7)
-                    training_views = ZoomDataset(root/train.files[0]['path']) if sharded else train
-                    quality_report(ema, flow, training_views, gallery, 'training', step, seed=config['seed']+7)
-                    del training_views
                 elapsed=time.perf_counter()-started
                 rate=(step-start)/elapsed
                 memory=torch.cuda.memory_allocated(device)/2**30
@@ -240,9 +591,6 @@ def train_masked(config, resume=None, max_seconds=None):
                     if stream is not None:
                         checkpoint['sampler'] = stream.state_dict()
                     tmp=output/'checkpoint.tmp';torch.save(checkpoint,tmp);tmp.replace(output/'checkpoint.pt')
-                    if step in config.get('quality_steps', []):
-                        import shutil
-                        shutil.copyfile(output/'checkpoint.pt', output/f'checkpoint-{step:06d}.pt')
                 if stop_for_time:
                     print('Training time limit reached; final evaluation and checkpoint saved.', flush=True)
                     break
@@ -273,12 +621,12 @@ def parse_training_args(argv=None):
             args.resume = args.resume / "checkpoint.pt"
         saved = torch.load(args.resume, map_location="cpu", weights_only=True)
     if args.config is not None:
-        config = json.loads(args.config.read_text())
+        config = runpy.run_path(str(args.config))["config"] if args.config.suffix == ".py" else json.loads(args.config.read_text())
     elif saved is not None:
         config = copy.deepcopy(saved["config"])
         config["output"] = str(args.resume.parent)
     else:
-        config = json.loads(Path("configs/flow64.json").read_text())
+        config = runpy.run_path("config/small.py")["config"]
     if args.output is not None:
         config["output"] = str(args.output)
     if args.steps is not None:
@@ -297,106 +645,6 @@ def parse_training_args(argv=None):
     return args, config
 
 
-def main():
-    args, config = parse_training_args()
-    output = Path(config["output"])
-    if config["formulation"] == "conditional-jit-x-pred":
-        train_masked(config,args.resume,max_seconds=args.max_seconds)
-        return
-    paired = config["formulation"] == "rectified-flow-4x-zoom"
-    if not paired and config["formulation"] != "modality-forcing-x-pred-single-image":
-        raise ValueError("Unsupported formulation")
-    device = torch.device(config["device"])
-    torch.manual_seed(config["seed"])
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(config["seed"])
-    train_path = Path(config["data"]) / "train.pt"
-    val_path = Path(config["data"]) / "val.pt"
-    hashes = {name: hashlib.sha256(path.read_bytes()).hexdigest()
-              for name, path in (("train", train_path), ("val", val_path))}
-    loader = load_zoom_pairs if paired else load_images
-    train = loader(train_path).to(device)
-    val = loader(val_path).to(device)
-    expected = (config["model"].get("channels", 1), config["size"], config["size"])
-    if paired:
-        expected = (2, *expected)
-    if train.shape[1:] != expected or val.shape[1:] != expected:
-        raise ValueError("Dataset shape disagrees with config")
-    if paired and config["architecture"] == "dit" and config["model"].get("condition_channels") != 3:
-        raise ValueError("Zoom DiT requires three conditioning channels")
-    if not paired and config["architecture"] != "dit":
-        raise ValueError("Unconditional training requires DiT")
-    model = build_model(config).to(device)
-    ema = copy.deepcopy(model).eval().requires_grad_(False)
-    diffusion = RectifiedFlow() if paired else XPredictionFlow(config["minimum_time"], config["time_shift"])
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"], weight_decay=0)
-    start = 0
-    if args.resume:
-        saved = torch.load(args.resume, map_location=device, weights_only=True)
-        if any(saved["config"].get(key) != config[key] for key in ("architecture", "size", "model")):
-            raise ValueError("Resume architecture mismatch; start a new run when switching models")
-        for key in ("size", "formulation", "minimum_time", "time_shift", "learning_rate", "ema_decay", "batch_size", "seed"):
-            if saved["config"].get(key) != config.get(key):
-                raise ValueError(f"Resume config mismatch: {key}")
-        if saved["dataset_sha256"] != hashes:
-            raise ValueError("Resume dataset differs from checkpoint")
-        model.load_state_dict(saved["model"])
-        ema.load_state_dict(saved["ema"])
-        optimizer.load_state_dict(saved["optimizer"])
-        start = saved["step"]
-        torch.set_rng_state(saved["cpu_rng"].cpu())
-        if device.type == "cuda":
-            torch.cuda.set_rng_state_all([state.cpu() for state in saved["cuda_rng"]])
-    if config["steps"] <= start:
-        parser.error("Total steps must exceed checkpoint step")
-    output.mkdir(parents=True, exist_ok=True)
-    (output / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-    parameter_count = sum(p.numel() for p in model.parameters())
-    print(f"architecture={config['architecture']}; device={device}; parameters={parameter_count:,}; train={len(train)}; val={len(val)}", flush=True)
-    initial_val = validation_loss(model, diffusion, val, config["batch_size"], config["seed"] + 1)
-    print(f"initial fixed-randomness validation MSE={initial_val:.6f}", flush=True)
-    started = time.perf_counter()
-    log_path = output / "loss.csv"
-    has_log = log_path.exists()
-    with log_path.open("a", newline="") as logfile:
-        writer = csv.writer(logfile)
-        if not has_log:
-            writer.writerow(("step", "train_mse", "val_mse", "ema_val_mse", "elapsed_seconds"))
-        for step in range(start + 1, config["steps"] + 1):
-            indices = torch.randint(len(train), (config["batch_size"],), device=device)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=paired):
-                loss = batch_loss(model, diffusion, train[indices])
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Nonfinite loss at step {step}")
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            if not torch.isfinite(grad_norm):
-                raise RuntimeError(f"Nonfinite gradients at step {step}")
-            optimizer.step()
-            with torch.no_grad():
-                for target, source in zip(ema.parameters(), model.parameters()):
-                    target.lerp_(source, 1 - config["ema_decay"])
-            val_loss, ema_loss = "", ""
-            if step % config["eval_every"] == 0 or step == config["steps"]:
-                val_loss = validation_loss(model, diffusion, val, config["batch_size"], config["seed"] + 1)
-                ema_loss = validation_loss(ema, diffusion, val, config["batch_size"], config["seed"] + 1)
-                ema.eval()
-                print(f"step={step} train={loss.item():.6f} val={val_loss:.6f} ema_val={ema_loss:.6f}", flush=True)
-            writer.writerow((step, loss.item(), val_loss, ema_loss, time.perf_counter() - started))
-            logfile.flush()
-            if step % config["checkpoint_every"] == 0 or step == config["steps"]:
-                checkpoint = {"config": config, "step": step, "model": model.state_dict(),
-                              "ema": ema.state_dict(), "optimizer": optimizer.state_dict(),
-                              "cpu_rng": torch.get_rng_state(),
-                              "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else [],
-                              "dataset_sha256": hashes, "parameters": parameter_count,
-                              "initial_val_mse": initial_val}
-                temporary = output / "checkpoint.tmp"
-                torch.save(checkpoint, temporary)
-                temporary.replace(output / "checkpoint.pt")
-    print(f"Saved {output / 'checkpoint.pt'}; this run performed {config['steps'] - start} optimizer steps", flush=True)
-
-
 if __name__ == "__main__":
-    main()
+    args, config = parse_training_args()
+    train_masked(config, args.resume, max_seconds=args.max_seconds)

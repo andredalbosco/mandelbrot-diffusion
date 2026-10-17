@@ -1,103 +1,33 @@
-"""Warp Mandelbrot renderer with reusable PyTorch buffers and a small viewer."""
-
-import argparse
+"""Batched CUDA Mandelbrot rendering with tent reconstruction."""
+import math
+from pathlib import Path
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
-import math
-import time
-from pathlib import Path
-
+from typing import Any
 import torch
 import warp as wp
 
-from viewer import Viewer
+@wp.func
+def dd_add(a: wp.vec2d, b: wp.vec2d):
+    total = a[0] + b[0]
+    v = total - a[0]
+    error = (a[0] - (total - v)) + (b[0] - v) + a[1] + b[1]
+    high = total + error
+    return wp.vec2d(high, error - (high - total))
 
 
-@wp.kernel(enable_backward=False)
-def escape_time_kernel(
-    center_x: wp.float64,
-    center_y: wp.float64,
-    span: wp.float64,
-    z0_x: wp.float64,
-    z0_y: wp.float64,
-    max_iterations: int,
-    counts: wp.array2d(dtype=wp.int32),
-    escape: wp.array2d(dtype=wp.float32),
-    styled_escape: wp.array2d(dtype=wp.float32),
-):
-    y, x = wp.tid()
-    height = counts.shape[0]
-    width = counts.shape[1]
-    # Square pixels sampled at their centers; row zero is the top of the view.
-    step = span / wp.float64(width)
-    cx = center_x + (wp.float64(x) + wp.float64(0.5) - wp.float64(width) * wp.float64(0.5)) * step
-    cy = center_y + (wp.float64(height) * wp.float64(0.5) - wp.float64(y) - wp.float64(0.5)) * step
-    zx = z0_x
-    zy = z0_y
-    n = int(0)
-
-    # These interior tests apply only to the standard z0 = 0 Mandelbrot set.
-    if z0_x == wp.float64(0.0) and z0_y == wp.float64(0.0):
-        dx = cx - wp.float64(0.25)
-        bulb_x = cx + wp.float64(1.0)
-        q = dx * dx + cy * cy
-        if q * (q + cx - wp.float64(0.25)) <= wp.float64(0.25) * cy * cy:
-            n = max_iterations
-        elif bulb_x * bulb_x + cy * cy <= wp.float64(0.0625):
-            n = max_iterations
-
-    radius_squared = zx * zx + zy * zy
-    while n < max_iterations and radius_squared <= wp.float64(4.0):
-        next_x = zx * zx - zy * zy + cx
-        zy = wp.float64(2.0) * zx * zy + cy
-        zx = next_x
-        radius_squared = zx * zx + zy * zy
-        n += 1
-
-    counts[y, x] = n
-    smooth = float(-1.0)
-    styled = float(-1.0)
-    if radius_squared > wp.float64(4.0):
-        # 3b1b's escape coordinate, before the additional potential refinement.
-        styled = float(wp.float64(n - 1) + wp.log(wp.float64(2.0)) / (wp.float64(0.5) * wp.log(radius_squared))
-                       + wp.float64(0.5) * wp.sqrt(cx * cx + cy * cy))
-        # Refine the potential after bailout without changing escape counts.
-        # Stop before squaring could overflow for unusually large inputs.
-        refined_n = n
-        for _ in range(3):
-            if radius_squared < wp.float64(1.0e100):
-                next_x = zx * zx - zy * zy + cx
-                zy = wp.float64(2.0) * zx * zy + cy
-                zx = next_x
-                radius_squared = zx * zx + zy * zy
-                refined_n += 1
-        # Continuous escape time: n + 1 - log2(log(|z|)).
-        smooth = float(wp.float64(refined_n + 1) - wp.log(wp.float64(0.5) * wp.log(radius_squared)) / wp.log(wp.float64(2.0)))
-    escape[y, x] = smooth
-    styled_escape[y, x] = styled
-
-
-@wp.kernel(enable_backward=False)
-def palette_kernel(
-    period: float,
-    offset: float,
-    escape: wp.array2d(dtype=wp.float32),
-    image: wp.array3d(dtype=wp.float32),
-):
-    y, x = wp.tid()
-    smooth = escape[y, x]
-    r = float(0.0)
-    g = float(0.0)
-    b = float(0.0)
-    if smooth != float(-1.0):
-        phase = float(6.283185307179586) * (smooth / period + offset)
-        r = float(0.5) + float(0.5) * wp.cos(phase)
-        g = float(0.5) + float(0.5) * wp.cos(phase + float(2.1))
-        b = float(0.5) + float(0.5) * wp.cos(phase + float(4.2))
-    image[y, x, 0] = r
-    image[y, x, 1] = g
-    image[y, x, 2] = b
-
+@wp.func
+def dd_mul(a: wp.vec2d, b: wp.vec2d):
+    product = a[0] * b[0]
+    split_a = wp.float64(134217729.0) * a[0]
+    split_b = wp.float64(134217729.0) * b[0]
+    ah = split_a - (split_a - a[0])
+    bh = split_b - (split_b - b[0])
+    al, bl = a[0] - ah, b[0] - bh
+    error = ((ah * bh - product) + ah * bl + al * bh) + al * bl
+    error += a[0] * b[1] + a[1] * b[0] + a[1] * b[1]
+    high = product + error
+    return wp.vec2d(high, error - (high - product))
 
 @wp.kernel(enable_backward=False)
 def escape_mask_kernel(
@@ -142,18 +72,6 @@ def average_samples_kernel(side: int, samples: wp.array2d(dtype=wp.float32),
         for sx in range(side):
             total += samples[y*side+sy, x*side+sx]
     coverage[y, x] = total / float(side*side)
-
-
-@wp.kernel(enable_backward=False)
-def average_colors_kernel(side: int, samples: wp.array3d(dtype=wp.float32),
-                          image: wp.array3d(dtype=wp.float32)):
-    y, x = wp.tid()
-    for channel in range(3):
-        total = float(0.0)
-        for sy in range(side):
-            for sx in range(side):
-                total += samples[y*side+sy, x*side+sx, channel]
-        image[y, x, channel] = total / float(side*side)
 
 
 @dataclass(frozen=True)
@@ -222,416 +140,6 @@ def renderer_devices(device):
     return device, wp.device_from_torch(device)
 
 
-@wp.kernel(enable_backward=False)
-def tent_resolve(samples: wp.array3d(dtype=wp.float32), side: int,
-                 offset_x: float, offset_y: float, image: wp.array3d(dtype=wp.float32)):
-    y, x = wp.tid()
-    # Coordinates measured from the first cached sample, in sample spacings.
-    sx = offset_x + (float(x) + 0.5) * float(side) - 0.5
-    sy = offset_y + (float(y) + 0.5) * float(side) - 0.5
-    ix, iy = int(wp.floor(sx)), int(wp.floor(sy))
-    total = wp.vec3(0.0)
-    weight_sum = float(0.0)
-    # Radius is one OUTPUT pixel: four samples across each axis at side=2.
-    for j in range(iy-side+1, iy+side+1):
-        for i in range(ix-side+1, ix+side+1):
-            weight = wp.max(0.0, 1.0-wp.abs(float(i)-sx)/float(side)) * wp.max(0.0, 1.0-wp.abs(float(j)-sy)/float(side))
-            total += weight * wp.vec3(samples[j, i, 0], samples[j, i, 1], samples[j, i, 2])
-            weight_sum += weight
-    for channel in range(3):
-        image[y, x, channel] = total[channel] / weight_sum
-
-
-class ColorRenderer:
-    """Render Mandelbrot escape-time colors into reusable CUDA buffers.
-
-    render() returns float32 RGB [height, width, 3] in [0, 1]. For box filtering, counts and
-    escape attributes contain per-sample int32 iteration counts and float32
-    smooth escape times, at [height*side, width*side]. Each subpixel is colored
-    before resolving the image. Unescaped samples have escape = -1 and RGB = 0. Buffers are reused:
-    clone tensors when retaining multiple frames. This is a forward renderer.
-    Tent filtering instead resolves a separate overscanned world grid; its orbit
-    and sample buffers live in _grid, while image retains the output dimensions.
-    """
-
-    styles = {
-        "cosine": "Cosine", "3b1b": "3b1b original", "3b1b_adaptive": "3b1b adaptive",
-        "smooth": "Smooth · blue & gold", "histogram": "Histogram equalized",
-        "stripes": "Orbit stripes", "orbit_trap": "Orbit trap · cross",
-        "fire": "Fire", "grayscale": "Grayscale",
-    }
-    color_fields = ("style", "mapping", "period", "phase", "lower", "upper", "repeat",
-                    "smooth_scale", "histogram_strength", "stripe_contrast", "trap_scale",
-                    "adaptive_clip", "adaptive_seconds")
-    color_defaults = dict(style="cosine", mapping="sqrt", period=2*math.pi/.15,
-                          phase=0., lower=1.5, upper=8., repeat=False,
-                          smooth_scale=.7, histogram_strength=1., stripe_contrast=1.,
-                          trap_scale=.2, adaptive_clip=2., adaptive_seconds=.35)
-
-    def __init__(self, width=1024, height=768, device="cuda", view=None, side=1, filter="box", pan_margin=True):
-        if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
-            raise ValueError("Width and height must be positive integers")
-        if type(side) is not int or not 1 <= side <= 16:
-            raise ValueError("AA side must be an integer from 1 to 16")
-        if filter not in ("box", "tent"):
-            raise ValueError("Unknown reconstruction filter")
-        self.filter = filter
-        self.pan_margin = pan_margin
-        self._grid = None
-        self._grid_key = None
-        self.device, self.warp_device = renderer_devices(device)
-        self.width, self.height = width, height
-        self.side = side
-        self.sample_width, self.sample_height = width*side, height*side
-        self.view = view if view is not None else View()
-        for name, value in self.color_defaults.items():
-            setattr(self, name, value)
-        self.counts = torch.empty((self.sample_height, self.sample_width), dtype=torch.int32, device=self.device)
-        self.escape = torch.empty((self.sample_height, self.sample_width), dtype=torch.float32, device=self.device)
-        self.styled_escape = torch.empty_like(self.escape)
-        self.image = torch.empty((height, width, 3), dtype=torch.float32, device=self.device)
-        self.samples = (self.image if side == 1 else
-                        torch.empty((self.sample_height, self.sample_width, 3), dtype=torch.float32, device=self.device))
-        # Wrap once: Warp and PyTorch share the same storage.
-        self._outputs = [wp.from_torch(tensor) for tensor in (self.counts, self.escape, self.image)]
-        self._styled_escape = wp.from_torch(self.styled_escape)
-        self._samples = wp.from_torch(self.samples)
-        self._adaptive_range = None
-        self._adaptive_time = None
-        self._adaptive_target_key = None
-        self.adaptive_pending = False
-        self._orbit_fields = None
-        self._orbit_key = None
-        self.precision = "float64"
-        self._reference_orbit = None
-        self._reference_length = wp.empty(1, dtype=wp.int32, device=self.warp_device)
-        # Blue/gold stops and escape coordinate from 3b1b/manim:
-        # https://github.com/3b1b/manim/tree/fafa083a4fb274bba9cabde0b6e2f50ba6da0622
-        # manimlib/mobject/fractals.py and shaders/mandelbrot_fractal.wgsl.
-        palettes = {
-            "3b1b": ["00065c", "061e7e", "0c37a0", "205abc", "4287d3",
-                     "d9ede4", "f0f9e4", "ba9f6a", "573706"],
-            "fire": ["08051a", "38104a", "861745", "d93629", "ff8b26", "fff2b0"],
-            "grayscale": ["000000", "ffffff"],
-            "blue_gold": ["000750", "1446b4", "50aae6", "ebfaff", "ffb92d", "822d0a", "000750"],
-            "teal_copper": ["05141c", "147d8c", "d2f0e1", "fab450", "962d14", "1e0c1e", "05141c"],
-        }
-        self.palettes = {
-            name: torch.tensor([[int(color[i:i+2], 16) / 255 for i in (0, 2, 4)] for color in colors],
-                               device=self.device)
-            for name, colors in palettes.items()
-        }
-
-    def minimum_span(self, view):
-        extent = max(abs(view.center.real), abs(view.center.imag), 1.0)
-        return 32 * 2.0**-100 * extent * self.sample_width
-
-    def validate_view(self, view):
-        if view.span < self.minimum_span(view):
-            raise ValueError("View exceeds the double-double precision margin")
-
-    def render(self, view=None):
-        view = self.view if view is None else view
-        self.validate_view(view)
-        if self.filter == "tent":
-            return self._render_grid(view)
-        self._orbit_key = None
-        self._adaptive_target_key = None
-        stream = wp.stream_from_torch(torch.cuda.current_stream(self.device))
-        extent = max(abs(view.center.real), abs(view.center.imag), 1.0)
-        if (view.span < 32 * math.ulp(extent) * self.sample_width
-                and view.z0 == 0j and view.iterations <= 65536):
-            # Reuse the dataset backend on exactly the viewer's sample lattice.
-            # No extra halo/resolve: the parent renderer owns its pan cache,
-            # palette and reconstruction. Keep both escape fields for G/3b1b.
-            from mandelbrot_fast import FastRenderer
-            self._tiled_backend = FastRenderer([view],width=self.sample_width,
-                                              height=self.sample_height,side=1,
-                                              precision="perturb32",tile=64,guard="bailout",
-                                              halo=False,device=str(self.device))
-            self._tiled_backend.render(resolve=False)
-            self.counts.copy_(self._tiled_backend.counts[0])
-            self.escape.copy_(self._tiled_backend.escape[0])
-            self.styled_escape.copy_(self._tiled_backend.styled_escape[0])
-            self.precision = "Tiled DD reference + FP32 perturbation + compact DD fallback"
-            self.view = view
-            return self.recolor()
-        if view.span < 32 * math.ulp(extent) * self.sample_width:
-            self.precision = "DD reference + float64 perturbation"
-            from deep_zoom import escape_time_dd_kernel, reference_orbit_kernel, perturbation_kernel
-            with localcontext() as context:
-                context.prec = 50
-                def split(value):
-                    high = float(value)
-                    return wp.vec2d(high, float(value-Decimal.from_float(high)))
-                cx, cy = (split(Decimal(value)) for value in view.center_exact)
-                step = split(Decimal(str(view.span))/Decimal(self.sample_width))
-            # A bounded reference allocation; exceptionally long or unstable
-            # trajectories automatically use the direct double-double fallback.
-            limit = min(view.iterations, 65536)
-            if self._reference_orbit is None or len(self._reference_orbit) < limit+1:
-                self._reference_orbit = wp.empty(limit+1, dtype=wp.vec4d, device=self.warp_device)
-            wp.launch(reference_orbit_kernel, dim=1,
-                      inputs=[cx, cy, view.z0.real, view.z0.imag, limit],
-                      outputs=[self._reference_orbit, self._reference_length],
-                      device=self.warp_device, stream=stream)
-            wp.launch(perturbation_kernel, dim=(self.sample_height, self.sample_width),
-                      inputs=[view.center.real, view.center.imag, view.span/self.sample_width, view.iterations,
-                              self._reference_orbit, self._reference_length],
-                      outputs=[*self._outputs[:2], self._styled_escape],
-                      device=self.warp_device, stream=stream)
-            wp.launch(escape_time_dd_kernel, dim=(self.sample_height, self.sample_width),
-                      inputs=[cx, cy, step, view.z0.real, view.z0.imag, view.iterations, True],
-                      outputs=[*self._outputs[:2], self._styled_escape],
-                      device=self.warp_device, stream=stream)
-            self.view = view
-            return self.recolor()
-        self.precision = "float64"
-        wp.launch(
-            escape_time_kernel,
-            dim=(self.sample_height, self.sample_width),
-            inputs=[view.center.real, view.center.imag, view.span, view.z0.real, view.z0.imag, view.iterations],
-            outputs=[*self._outputs[:2], self._styled_escape],
-            device=self.warp_device,
-            stream=stream,
-        )
-        self.view = view
-        return self.recolor()
-
-    def _render_grid(self, view):
-        key = (view.span, view.iterations, view.z0)
-        if self._grid_key != key:
-            self._grid_key = key
-            self._grid_anchor = view
-            with localcontext() as context:
-                context.prec = 50
-                self._grid_step = Decimal(str(view.span)) / Decimal(self.sample_width)
-            self._grid_origin = None
-            # A quarter-view margin avoids orbit evaluations on most pan frames.
-            margin = max(2*self.side, (max(self.sample_width, self.sample_height)+3)//4 if self.pan_margin else 0)
-            self._grid = ColorRenderer(self.sample_width+2*margin, self.sample_height+2*margin,
-                                       device=str(self.device))
-        grid = self._grid
-        with localcontext() as context:
-            context.prec = 50
-            dx = (Decimal(view.center_exact[0])-Decimal(self._grid_anchor.center_exact[0])) / self._grid_step
-            dy = -(Decimal(view.center_exact[1])-Decimal(self._grid_anchor.center_exact[1])) / self._grid_step
-            origin = self._grid_origin
-            ox = float(dx-origin[0]) if origin else 0.0
-            oy = float(dy-origin[1]) if origin else 0.0
-            mx = (grid.width-self.sample_width)/2
-            my = (grid.height-self.sample_height)/2
-            if origin is None or abs(ox) > mx-self.side or abs(oy) > my-self.side:
-                # Integer moves preserve the lattice; Decimal keeps deep anchors.
-                origin = (round(dx), round(dy))
-                self._grid_origin = origin
-                real = Decimal(self._grid_anchor.center_exact[0]) + origin[0]*self._grid_step
-                imag = Decimal(self._grid_anchor.center_exact[1]) - origin[1]*self._grid_step
-                cache_view = View(center=f"({real}{'' if imag < 0 else '+'}{imag}j)",
-                                  span=float(self._grid_step*grid.width),
-                                  iterations=view.iterations, z0=view.z0)
-                grid.render(cache_view)
-                ox, oy = float(dx-origin[0]), float(dy-origin[1])
-        self._grid_offset = (mx+ox, my+oy)
-        self.view = view
-        self.precision = grid.precision
-        return self.recolor()
-
-    def color_settings(self):
-        return {name: getattr(self, name) for name in self.color_fields}
-
-    def reset_colors(self):
-        """Restore only the controls used by the selected coloring scheme."""
-        fields = {
-            "cosine": ("period",), "smooth": ("smooth_scale",),
-            "histogram": ("histogram_strength",), "stripes": ("stripe_contrast",),
-            "orbit_trap": ("trap_scale",),
-            "3b1b_adaptive": ("adaptive_clip", "adaptive_seconds"),
-        }.get(self.style, ("mapping", "lower", "upper", "repeat"))
-        self.set_colors(**{name: self.color_defaults[name] for name in ("phase", *fields)})
-
-    def set_colors(self, **updates):
-        """Validate controls without launching GPU work on the UI thread."""
-        unknown = updates.keys() - self.color_fields
-        if unknown:
-            raise ValueError(f"Unknown color controls: {', '.join(unknown)}")
-        values = self.color_settings() | {k: v for k, v in updates.items() if v is not None}
-        if values["style"] not in self.styles or values["mapping"] not in ("linear", "sqrt", "log"):
-            raise ValueError("Unknown color style or value mapping")
-        for name in self.color_fields[2:]:
-            if not math.isfinite(values[name]):
-                raise ValueError(f"{name} must be finite")
-        if values["period"] <= 0 or values["lower"] >= values["upper"]:
-            raise ValueError("Need period > 0 and color range min < max")
-        for name in ("smooth_scale", "stripe_contrast", "trap_scale"):
-            if values[name] <= 0:
-                raise ValueError(f"{name} must be positive")
-        if not 0 <= values["histogram_strength"] <= 1:
-            raise ValueError("Histogram strength must be in [0, 1]")
-        if not 0 <= values["adaptive_clip"] < 50 or values["adaptive_seconds"] < 0:
-            raise ValueError("Need tail clip in [0, 50) and adaptation seconds >= 0")
-        if values["style"] != self.style:
-            self._adaptive_range = self._adaptive_time = None
-        for name, value in values.items():
-            setattr(self, name, value)
-
-    def _visible(self, field):
-        """View statistics exclude the overscan used for cached panning."""
-        if self.filter != "tent" or self._grid is None:
-            return field
-        x, y = (round(v) for v in self._grid_offset)
-        return field[y:y+self.sample_height, x:x+self.sample_width]
-
-    def _adaptive_limits(self, values, valid):
-        key = (self.view, self.adaptive_clip)
-        if self._adaptive_target_key != key:
-            visible = self._visible(values)[self._visible(valid)]
-            if visible.numel():
-                q = values.new_tensor([self.adaptive_clip/100, 1-self.adaptive_clip/100])
-                target = torch.quantile(visible, q)
-                # A flat field must not divide by zero or amplify roundoff.
-                gap = torch.maximum(target[0].abs()*1e-5, target.new_tensor(1e-4))
-                target[1] = torch.maximum(target[1], target[0]+gap)
-            else:
-                target = self._adaptive_range
-                if target is None:
-                    target = values.new_tensor([1.5, 8.0])
-            self._adaptive_target = target
-            self._adaptive_target_key = key
-        target = self._adaptive_target
-        now = time.monotonic()
-        if self._adaptive_range is None or self.adaptive_seconds == 0:
-            self._adaptive_range = target.clone()
-        else:
-            dt = max(0., now-self._adaptive_time)
-            amount = -math.expm1(-dt/self.adaptive_seconds)
-            self._adaptive_range = torch.lerp(self._adaptive_range, target, amount)
-        self._adaptive_time = now
-        tolerance = (target[1]-target[0]).clamp_min(1e-4)*.002
-        self.adaptive_pending = bool(((target-self._adaptive_range).abs().max() > tolerance).item())
-        if not self.adaptive_pending:
-            self._adaptive_range = target.clone()
-        return self._adaptive_range
-
-    def orbit_fields(self):
-        """Compute once per sample grid; color sliders reuse both orbit fields."""
-        if self._orbit_key != self.view:
-            from deep_zoom import orbit_fields_kernel
-            with localcontext() as context:
-                context.prec = 50
-                def split(value):
-                    high = float(value)
-                    return wp.vec2d(high, float(value-Decimal.from_float(high)))
-                cx, cy = (split(Decimal(v)) for v in self.view.center_exact)
-                step = split(Decimal(str(self.view.span))/self.sample_width)
-            if self._orbit_fields is None:
-                self._orbit_fields = torch.empty((*self.escape.shape, 2), device=self.device)
-            deep = self.precision != "float64"
-            wp.launch(orbit_fields_kernel, dim=self.escape.shape,
-                      inputs=[cx, cy, step, self.view.z0.real, self.view.z0.imag,
-                              self.view.iterations, deep, self._outputs[1]],
-                      outputs=[wp.from_torch(self._orbit_fields, dtype=wp.vec2)],
-                      device=self.warp_device,
-                      stream=wp.stream_from_torch(torch.cuda.current_stream(self.device)))
-            self._orbit_key = self.view
-        return self._orbit_fields
-
-    def _histogram(self, values, valid):
-        visible = self._visible(values)[self._visible(valid)]
-        if not visible.numel():
-            return torch.zeros_like(values)
-        low, high = visible.min(), visible.max()
-        span = (high-low).clamp_min(1e-6)
-        alpha = ((values-low)/span).clamp(0, 1)
-        positions = ((visible-low)/span*511).clamp(0, 511)
-        counts = torch.bincount(positions.long(), minlength=512).to(values.dtype)
-        cdf = counts.cumsum(0)/counts.sum().clamp_min(1)
-        before = torch.cat((cdf.new_zeros(1), cdf[:-1]))
-        index = (alpha*511).long()
-        equalized = before[index]+(cdf-before)[index]*(alpha*511-index)
-        return torch.lerp(alpha, equalized, self.histogram_strength)
-
-    def _color_samples(self, source):
-        style = self.style
-        valid = source.escape != -1
-        if style == "cosine":
-            wp.launch(palette_kernel, dim=source.escape.shape,
-                      inputs=[self.period, self.phase, source._outputs[1]], outputs=[source._samples],
-                      device=self.warp_device,
-                      stream=wp.stream_from_torch(torch.cuda.current_stream(self.device)))
-            return
-        palette_name = "blue_gold"
-        if style == "smooth":
-            alpha = (source.escape.clamp_min(0).log1p()*self.smooth_scale+self.phase).remainder(1)
-        elif style == "histogram":
-            alpha = (self._histogram(source.escape.clamp_min(0).log1p(), valid)+self.phase).clamp(0, 1)
-        elif style == "stripes":
-            alpha = ((source.orbit_fields()[...,0]-.5)*self.stripe_contrast+.5+self.phase).clamp(0, 1)
-        elif style == "orbit_trap":
-            alpha = (-source.orbit_fields()[...,1].clamp_min(1e-30).log10()*self.trap_scale+self.phase).remainder(1)
-            palette_name = "teal_copper"
-        elif style == "3b1b_adaptive":
-            values = source.styled_escape.clamp_min(0).sqrt()
-            lower, upper = self._adaptive_limits(values, valid)
-            alpha = ((values-lower)/(upper-lower)+self.phase).clamp(0, 1)
-            palette_name = "3b1b"
-        else:
-            values = (source.styled_escape if style == "3b1b" else source.escape).clamp_min(0)
-            if self.mapping == "sqrt":
-                values = values.sqrt()
-            elif self.mapping == "log":
-                values = values.log1p()
-            alpha = (values-self.lower)/(self.upper-self.lower)+self.phase
-            alpha = alpha.remainder(1) if self.repeat else alpha.clamp(0, 1)
-            palette_name = style
-        palette = self.palettes[palette_name]
-        position = alpha*(len(palette)-1)
-        index = position.long().clamp(0, len(palette)-2)
-        rgb = torch.lerp(palette[index], palette[index+1], (position-index)[...,None])
-        source.samples.copy_(torch.where(valid[...,None], rgb, 0))
-
-    def recolor(self, **updates):
-        """Color cached samples, lazily adding orbit fields for stripes/traps."""
-        self.set_colors(**updates)
-        self.adaptive_pending = False
-        source = self._grid if self.filter == "tent" and self._grid is not None else self
-        self._color_samples(source)
-        stream = wp.stream_from_torch(torch.cuda.current_stream(self.device))
-        if source is not self:
-            wp.launch(tent_resolve, dim=(self.height, self.width),
-                      inputs=[source._samples, self.side, *self._grid_offset], outputs=[self._outputs[2]],
-                      device=self.warp_device, stream=stream)
-        elif self.side > 1:
-            wp.launch(average_colors_kernel, dim=(self.height, self.width),
-                      inputs=[self.side, self._samples], outputs=[self._outputs[2]],
-                      device=self.warp_device, stream=stream)
-        return self.image
-
-    def escape_time_image(self):
-        """Resolve smooth escape time and coverage without palette dependence."""
-        grid = self._grid if self.filter == "tent" and self._grid is not None else self
-        valid = (grid.escape != -1).float()
-        packed = torch.stack((grid.escape.clamp_min(0)*valid, valid, torch.zeros_like(valid)), dim=-1)
-        if grid is not self:
-            resolved = torch.empty_like(self.image)
-            wp.launch(tent_resolve, dim=(self.height,self.width),
-                      inputs=[wp.from_torch(packed),self.side,*self._grid_offset],
-                      outputs=[wp.from_torch(resolved)],device=self.warp_device,
-                      stream=wp.stream_from_torch(torch.cuda.current_stream(self.device)))
-        else:
-            resolved = torch.nn.functional.avg_pool2d(packed.permute(2,0,1)[None],self.side)[0].permute(1,2,0)
-        coverage = resolved[...,1]
-        return resolved[...,0]/coverage.clamp_min(1e-8), coverage
-
-    def save(self, path):
-        import matplotlib.image as mpimg
-
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mpimg.imsave(path, self.image.cpu().numpy())
-        return path
-
-
 class GrayscaleRenderer:
     """Reusable float32 [H,W] coverage: black unescaped, white escaped.
 
@@ -684,54 +192,656 @@ class GrayscaleRenderer:
         mpimg.imsave(path, self.image.cpu().numpy(), cmap="gray", vmin=0, vmax=1)
         return path
 
+@wp.func
+def iterate(cx: Any, cy: Any, limit: int):
+    zx, zy = type(cx)(0.0), type(cx)(0.0)
+    xx, yy = type(cx)(0.0), type(cx)(0.0)
+    n = int(0)
+    dx = cx-type(cx)(0.25)
+    q = dx*dx+cy*cy
+    if q*(q+dx) <= type(cx)(0.25)*cy*cy or (cx+type(cx)(1.0))*(cx+type(cx)(1.0))+cy*cy <= type(cx)(0.0625):
+        n = limit
+    while n < limit and xx+yy <= type(cx)(4.0):
+        zy = type(cx)(2.0)*zx*zy+cy
+        zx = xx-yy+cx
+        xx, yy = zx*zx, zy*zy
+        n += 1
+    smooth = float(-1.0)
+    if xx+yy > type(cx)(4.0):
+        refined = n
+        for _ in range(3):
+            if xx+yy < type(cx)(1e15):
+                zy = type(cx)(2.0)*zx*zy+cy
+                zx = xx-yy+cx
+                xx, yy = zx*zx, zy*zy
+                refined += 1
+        smooth = float(type(cx)(refined+1)-wp.log(type(cx)(0.5)*wp.log(xx+yy))/type(cx)(0.6931471805599453))
+    return wp.vec2(float(n), smooth)
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--height", type=int, default=128)
-    parser.add_argument("--center", nargs=2, default=("-0.5", "0.0"), metavar=("REAL", "IMAG"))
-    parser.add_argument("--span", type=float, default=3.5, help="Horizontal extent in the complex plane")
-    parser.add_argument("--iterations", type=int, default=512)
-    parser.add_argument("--z0", type=float, nargs=2, default=(0.0, 0.0), metavar=("REAL", "IMAG"))
-    parser.add_argument("--device", default="cuda", help="cuda or cuda:N")
-    parser.add_argument("--bw", action="store_true", help="Render antialiased black-and-white coverage")
-    parser.add_argument("--palette", choices=tuple(ColorRenderer.styles), default="cosine")
-    parser.add_argument("--aa-side", type=int, default=2, help="Subpixel grid side (2 gives four samples per pixel)")
-    parser.add_argument("--filter", choices=("tent", "box"), default="tent",
-                        help="Color reconstruction: anchored tent filtering or view-aligned box averaging")
-    parser.add_argument("--headless", action="store_true", help="Render one PNG without opening a window")
-    parser.add_argument("--watch", action="store_true", help="Restart the viewer after Python source edits")
-    parser.add_argument("--output", default="output/mandelbrot.png")
-    args = parser.parse_args()
-    if args.watch:
-        if args.headless:
-            parser.error("--watch is for the interactive viewer")
-        from viewer import watch
-        watch()
+
+@wp.func
+def color(smooth: float):
+    value = wp.vec3(0.0)
+    if smooth != -1.0:
+        phase = smooth*0.15
+        value = wp.vec3(0.5+0.5*wp.cos(phase), 0.5+0.5*wp.cos(phase+2.1), 0.5+0.5*wp.cos(phase+4.2))
+    return value
+
+
+@wp.kernel(enable_backward=False)
+def direct_kernel(views: wp.array2d(dtype=Any), limits: wp.array(dtype=int),
+                  side: int, width: int, counts: wp.array3d(dtype=int),
+                  samples: wp.array3d(dtype=wp.vec3), escape: wp.array3d(dtype=float)):
+    b, y, x = wp.tid()
+    step = views[b, 2]/type(views[b, 0])(width*side)
+    cx = views[b, 0]+(type(step)(x)+type(step)(0.5)-type(step)(counts.shape[2])*type(step)(0.5))*step
+    cy = views[b, 1]+(type(step)(counts.shape[1])*type(step)(0.5)-type(step)(y)-type(step)(0.5))*step
+    result = iterate(cx, cy, limits[b])
+    counts[b, y, x] = int(result[0])
+    samples[b, y, x] = color(result[1])
+    escape[b, y, x] = result[1]
+
+
+@wp.kernel(enable_backward=False)
+def recolor_kernel(escape: wp.array3d(dtype=float), palette: wp.array(dtype=wp.vec3),
+                   coordinates: wp.array3d(dtype=float), samples: wp.array3d(dtype=wp.vec3)):
+    b, y, x = wp.tid()
+    smooth = escape[b, y, x]
+    rgb = wp.vec3(0.0)
+    if smooth != -1.0:
+        alpha = wp.clamp(coordinates[b, y, x], 0.0, 1.0)
+        position = alpha * float(palette.shape[0] - 1)
+        index = wp.min(int(position), palette.shape[0] - 2)
+        rgb = wp.lerp(palette[index], palette[index + 1], position - float(index))
+    samples[b, y, x] = rgb
+
+
+@wp.kernel(enable_backward=False)
+def orbit_coloring_kernel(views: wp.array2d(dtype=wp.float64), side: int, width: int,
+                          counts: wp.array3d(dtype=int), escape: wp.array3d(dtype=float),
+                          fields: wp.array3d(dtype=wp.vec2)):
+    """Cross trap over z1..escape; mathr's five-octave post-escape stripes."""
+    b, y, x = wp.tid()
+    fields[b, y, x] = wp.vec2(0.0)
+    if escape[b, y, x] == -1.0:
         return
-    try:
-        real, imag = args.center
-        view = View(f"({real}{'' if imag.startswith('-') else '+'}{imag}j)", args.span, args.iterations, complex(*args.z0))
-        if args.bw:
-            renderer = GrayscaleRenderer(args.width, args.height, args.device, args.aa_side, view)
+    step = views[b, 2] / wp.float64(width * side)
+    cx = views[b, 0] + (wp.float64(x) + wp.float64(.5) - wp.float64(counts.shape[2]) * wp.float64(.5)) * step
+    cy = views[b, 1] + (wp.float64(counts.shape[1]) * wp.float64(.5) - wp.float64(y) - wp.float64(.5)) * step
+    zx, zy = wp.float64(0.0), wp.float64(0.0)
+    xx, yy = wp.float64(0.0), wp.float64(0.0)
+    trap = wp.float64(1e30)
+    for _ in range(counts[b, y, x]):
+        zy = wp.float64(2.0)*zx*zy+cy
+        zx = xx-yy+cx
+        xx, yy = zx*zx, zy*zy
+        trap = wp.min(trap, wp.min(wp.abs(zx), wp.abs(zy)))
+    for _ in range(3):
+        if xx+yy < wp.float64(1e15):
+            zy = wp.float64(2.0)*zx*zy+cy
+            zx = xx-yy+cx
+            xx, yy = zx*zx, zy*zy
+    radius = wp.sqrt(zx*zx+zy*zy)
+    zx, zy = zx/radius, zy/radius
+    f = wp.float64(escape[b, y, x] - wp.floor(escape[b, y, x]))
+    weight = wp.float64(1.0) - f
+    total = wp.float64(0.0)
+    for _ in range(5):
+        total += weight*zy
+        weight = wp.float64(1.0)
+        zx, zy = zx*zx-zy*zy, wp.float64(2.0)*zx*zy
+    total = (total+f*zy)/wp.float64(5.0)
+    fields[b, y, x] = wp.vec2(wp.clamp(float(wp.float64(.5)+wp.float64(.5)*total), 0.0, 1.0), float(trap))
+
+
+@wp.kernel(enable_backward=False)
+def resolve_kernel(side: int, samples: wp.array3d(dtype=wp.vec3), image: wp.array3d(dtype=wp.vec3)):
+    b, y, x = wp.tid()
+    sx = float(side)+(float(x)+0.5)*float(side)-0.5
+    sy = float(side)+(float(y)+0.5)*float(side)-0.5
+    ix, iy = int(wp.floor(sx)), int(wp.floor(sy))
+    total = wp.vec3(0.0)
+    weight_sum = float(0.0)
+    for j in range(iy-side+1, iy+side+1):
+        wy = wp.max(0.0, 1.0-wp.abs(float(j)-sy)/float(side))
+        for i in range(ix-side+1, ix+side+1):
+            weight = wy*wp.max(0.0, 1.0-wp.abs(float(i)-sx)/float(side))
+            total += weight*samples[b, j, i]
+            weight_sum += weight
+    image[b, y, x] = total/weight_sum
+
+
+class FastRenderer:
+    """A reusable batch; render() returns CUDA float RGB [B,H,W,3].
+
+    Direct and perturbation modes fill raw escape fields; perturbation also
+    fills styled_escape. Hybrid mode does not expose either field. A caller
+    owning reconstruction can disable the halo and use render(resolve=False),
+    which returns raw colored samples instead of the resolved image.
+    """
+
+    def __init__(self, views, width=128, height=128, side=2, precision="float64", tile=32, guard="strict", compact=True, halo=True, device="cuda"):
+        if precision not in ("float32", "float64", "hybrid32", "perturb32", "perturb64"):
+            raise ValueError("Unknown precision")
+        if not views or any(type(v) is not int for v in (width,height,side)) or min(width, height, side) < 1 or side > 16:
+            raise ValueError("Need nonempty views and positive dimensions")
+        self.width, self.height, self.side = width, height, side
+        self.precision = precision
+        if guard not in ("strict", "bailout"):
+            raise ValueError("Unknown perturbation guard")
+        self.guard = guard
+        self.compact = compact
+        device = torch.device(device)
+        self.device = str(torch.device("cuda", torch.cuda.current_device()) if device.index is None else device)
+        self.halo = bool(halo)
+        wp.init()
+        eps = 2**(-23 if precision == "float32" else -52)
+        for view in views:
+            if view.iterations > 65536:
+                raise ValueError("Experimental renderer supports at most 65536 iterations")
+            minimum = 32*(2**-100 if precision.startswith("perturb") else eps)*max(1., abs(view.center))*width*side
+            if view.z0 != 0j or view.span < minimum:
+                raise ValueError(f"View is outside the {precision} direct-coordinate margin")
+        dtype = torch.float32 if precision == "float32" else torch.float64
+        self.views = torch.tensor([(v.center.real, v.center.imag, v.span) for v in views], device=self.device, dtype=dtype)
+        self.limits = torch.tensor([v.iterations for v in views], device=self.device, dtype=torch.int32)
+        batch = len(views)
+        self.counts = torch.empty((batch, height*side+2*side*int(self.halo), width*side+2*side*int(self.halo)), device=self.device, dtype=torch.int32)
+        self.samples = torch.empty((*self.counts.shape, 3), device=self.device)
+        self.escape = torch.empty_like(self.counts, dtype=torch.float32)
+        self.styled_escape = torch.empty_like(self.escape)
+        self._escape = wp.from_torch(self.escape)
+        self._styled_escape = wp.from_torch(self.styled_escape)
+        self.image = torch.empty((batch, height, width, 3), device=self.device)
+        self._views = wp.from_torch(self.views)
+        self._limits = wp.from_torch(self.limits)
+        self._counts = wp.from_torch(self.counts)
+        self._samples = wp.from_torch(self.samples, dtype=wp.vec3)
+        self._image = wp.from_torch(self.image, dtype=wp.vec3)
+        if precision.startswith("perturb") or precision == "hybrid32":
+            self.reasons = wp.zeros(5,dtype=wp.int64,device=self.device)
+            self.fallbacks = wp.zeros(batch, dtype=int, device=self.device)
+            self.queue = wp.empty(self.counts.numel(), dtype=int, device=self.device)
+            self.queue_length = wp.zeros(1, dtype=int, device=self.device)
+        if precision.startswith("perturb"):
+            if type(tile) is not int or tile < 1:
+                raise ValueError("Tile side must be positive")
+            self.tile = tile
+            self.tiles_x = (self.counts.shape[2]+tile-1)//tile
+            tiles_y = (self.counts.shape[1]+tile-1)//tile
+            self.reference_limit = min(max(v.iterations for v in views), 65536)
+            self.references = wp.empty((batch, tiles_y*self.tiles_x, self.reference_limit+1), dtype=wp.vec4d, device=self.device)
+            self.lengths = wp.empty((batch, tiles_y*self.tiles_x), dtype=int, device=self.device)
+            centers, steps = [], []
+            with localcontext() as context:
+                context.prec = 50
+                def split(value):
+                    high = float(value)
+                    return (high, float(value-Decimal.from_float(high)))
+                for view in views:
+                    centers.append((*split(Decimal(view.center_exact[0])), *split(Decimal(view.center_exact[1]))))
+                    steps.append(split(Decimal(str(view.span))/Decimal(width*side)))
+            self.centers = wp.array(centers, dtype=wp.vec4d, device=self.device)
+            self.steps = wp.array(steps, dtype=wp.vec2d, device=self.device)
+
+    def render(self, resolve=True):
+        if resolve and not self.halo:
+            raise ValueError("Rendering without a filter halo requires resolve=False")
+        stream = wp.stream_from_torch(torch.cuda.current_stream())
+        # Memsets for counters must be ordered with the kernels on Torch's stream.
+        with wp.ScopedStream(stream):
+            return self._render(stream, resolve)
+
+    def _render(self, stream, resolve=True):
+        if self.precision.startswith("perturb"):
+            self._timing_events = []
+            def mark():
+                event=torch.cuda.Event(enable_timing=True)
+                event.record(torch.cuda.current_stream(self.device))
+                self._timing_events.append(event)
+            self.reasons.zero_()
+            mark()
+            wp.launch(tiled_reference_kernel, dim=self.lengths.shape,
+                      inputs=[self.centers, self.steps, self._limits, self.tile, self.tiles_x,
+                              self.counts.shape[2], self.counts.shape[1], self.reference_limit],
+                      outputs=[self.references, self.lengths], device=self.device, stream=stream)
+            mark()
+            self.fallbacks.zero_()
+            self.queue_length.zero_()
+            marker = wp.float32(1) if self.precision == "perturb32" else wp.float64(0)
+            wp.launch(tiled_perturbation_kernel, dim=self.counts.shape,
+                      inputs=[self.references, self.lengths, self.steps, self._limits,
+                              self.tile, self.tiles_x, marker, self.guard == "strict"],
+                      outputs=[self._counts, self._samples, self._escape, self._styled_escape, self.fallbacks, self.queue, self.queue_length, self.reasons], device=self.device, stream=stream)
+            mark()
+            wp.launch(batched_dd_fallback, dim=self.counts.numel(),
+                      inputs=[self.centers, self.steps, self._limits, self.queue, self.queue_length, self.compact], outputs=[self._counts, self._samples, self._escape, self._styled_escape],
+                      device=self.device, stream=stream)
+            mark()
+        elif self.precision == "hybrid32":
+            self.fallbacks.zero_()
+            self.queue_length.zero_()
+            wp.launch(hybrid_kernel, dim=self.counts.shape,
+                      inputs=[self._views, self._limits, self.side, self.width],
+                      outputs=[self._counts, self._samples, self.fallbacks, self.queue, self.queue_length],
+                      device=self.device, stream=stream)
+            wp.launch(fp64_fallback, dim=self.counts.numel(),
+                      inputs=[self._views, self._limits, self.side, self.width, self.queue, self.queue_length],
+                      outputs=[self._counts, self._samples], device=self.device, stream=stream)
         else:
-            renderer = ColorRenderer(args.width, args.height, args.device, view, side=args.aa_side, filter=args.filter)
-            renderer.style = args.palette
-    except (ValueError, RuntimeError) as error:
-        parser.error(str(error))
-    if args.headless:
-        renderer.render()
-        print(f"Saved {renderer.save(args.output)} ({renderer.device})")
+            wp.launch(direct_kernel, dim=self.counts.shape,
+                      inputs=[self._views, self._limits, self.side, self.width],
+                      outputs=[self._counts, self._samples, self._escape], device=self.device, stream=stream)
+        if resolve:
+            wp.launch(resolve_kernel, dim=self.image.shape[:3], inputs=[self.side, self._samples],
+                      outputs=[self._image], device=self.device, stream=stream)
+        return self.image if resolve else self.samples
+
+    def orbit_coloring(self):
+        """Return per-sample (post-escape stripe, cross-trap distance) fields."""
+        if self.precision != 'float64':
+            raise ValueError('Orbit coloring currently requires direct float64 rendering')
+        fields = torch.empty((*self.counts.shape, 2), device=self.device)
+        wp.launch(orbit_coloring_kernel, dim=self.counts.shape,
+                  inputs=[self._views, self.side, self.width, self._counts, self._escape],
+                  outputs=[wp.from_torch(fields, dtype=wp.vec2)], device=self.device,
+                  stream=wp.stream_from_torch(torch.cuda.current_stream(self.device)))
+        return fields
+
+    def recolor(self, palette, coordinates):
+        """Apply an RGB lookup table to existing samples, then tent-filter RGB."""
+        if self.precision == "hybrid32" or not self.halo:
+            raise ValueError("Recoloring requires direct/perturbation samples and a filter halo")
+        palette = torch.as_tensor(palette, dtype=torch.float32, device=self.device).contiguous()
+        if palette.ndim != 2 or palette.shape[1] != 3 or len(palette) < 2:
+            raise ValueError("Palette must be [N,3], with at least two colors")
+        if not torch.isfinite(palette).all() or palette.min() < 0 or palette.max() > 1:
+            raise ValueError("Palette colors must be finite and in [0,1]")
+        coordinates = torch.as_tensor(coordinates, dtype=torch.float32, device=self.device).contiguous()
+        if coordinates.shape != self.escape.shape or not torch.isfinite(coordinates).all():
+            raise ValueError('Need one finite palette coordinate per spatial sample')
+        stream = wp.stream_from_torch(torch.cuda.current_stream(self.device))
+        wp.launch(recolor_kernel, dim=self.counts.shape,
+                  inputs=[self._escape, wp.from_torch(palette, dtype=wp.vec3), wp.from_torch(coordinates)],
+                  outputs=[self._samples], device=self.device, stream=stream)
+        wp.launch(resolve_kernel, dim=self.image.shape[:3], inputs=[self.side, self._samples],
+                  outputs=[self._image], device=self.device, stream=stream)
+        return self.image
+
+
+    def diagnostics(self):
+        """Read completed stage events/counters; call outside the UI thread."""
+        if not self.precision.startswith("perturb"):return {}
+        events=self._timing_events
+        reasons=self.reasons.numpy().tolist()
+        failed=sum(reasons[:4])
+        return {"gpu_ms":{name:events[i].elapsed_time(events[i+1]) for i,name in enumerate(("references","perturbation","dd_fallback"))},
+                "fallback_reasons":dict(zip(("bailout_uncertainty","cancellation","roundoff_guard","reference_exhausted"),reasons[:4])),
+                "fallback_fraction":failed/self.counts.numel(),
+                "mean_iterations_before_fallback":reasons[4]/failed if failed else 0.}
+
+
+@wp.kernel(enable_backward=False)
+def hybrid_kernel(views: wp.array2d(dtype=wp.float64), limits: wp.array(dtype=int), side: int, width: int,
+                  counts: wp.array3d(dtype=int), samples: wp.array3d(dtype=wp.vec3),
+                  fallbacks: wp.array(dtype=int), queue: wp.array(dtype=int), queue_length: wp.array(dtype=int)):
+    b, y, x = wp.tid()
+    step = views[b, 2]/wp.float64(width*side)
+    cx = views[b, 0]+(wp.float64(x)+wp.float64(.5)-wp.float64(counts.shape[2])*wp.float64(.5))*step
+    cy = views[b, 1]+(wp.float64(counts.shape[1])*wp.float64(.5)-wp.float64(y)-wp.float64(.5))*step
+    dx = cx-wp.float64(.25)
+    q = dx*dx+cy*cy
+    interior = q*(q+dx) < wp.float64(.25)*cy*cy or (cx+wp.float64(1))*(cx+wp.float64(1))+cy*cy < wp.float64(.0625)
+    n = int(0)
+    if interior:
+        n = limits[b]
+    fx, fy = float(cx), float(cy)
+    coordinate_error = float(wp.abs(cx-wp.float64(fx))+wp.abs(cy-wp.float64(fy)))
+    zx, zy = float(0.0), float(0.0)
+    xx, yy = float(0.0), float(0.0)
+    error = float(0.0)
+    failed = bool(False)
+    while n < limits[b]:
+        r2 = xx+yy
+        radius_error = (2.0*(wp.abs(zx)+wp.abs(zy))+2.0*error)*error+1e-6*(r2+1.0)
+        if wp.abs(r2-4.0) <= radius_error or error > 1e-4*(wp.abs(zx)+wp.abs(zy)+1.0):
+            failed = True
+            break
+        if r2 > 4.0:
+            break
+        error = (2.000002*wp.sqrt(r2)+error)*error+coordinate_error+1e-6*(r2+wp.abs(fx)+wp.abs(fy))
+        zy = 2.0*zx*zy+fy
+        zx = xx-yy+fx
+        xx, yy = zx*zx, zy*zy
+        n += 1
+    # Check the final state too: the last iteration can be uncertain or escape.
+    r2 = xx+yy
+    radius_error = (2.0*(wp.abs(zx)+wp.abs(zy))+2.0*error)*error+1e-6*(r2+1.0)
+    if not interior and (wp.abs(r2-4.0) <= radius_error or error > 1e-4*(wp.abs(zx)+wp.abs(zy)+1.0)):
+        failed = True
+    counts[b, y, x] = n
+    if failed:
+        counts[b, y, x] = -1
+        wp.atomic_add(fallbacks, b, 1)
+        index = wp.atomic_add(queue_length, 0, 1)
+        queue[index] = (b*counts.shape[1]+y)*counts.shape[2]+x
     else:
-        import signal
-        def stop_viewer(_signum, _frame):
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, stop_viewer)
-        try:
-            Viewer(renderer, args.output).show()
-        except KeyboardInterrupt:
-            pass
+        smooth = float(-1.0)
+        if r2 > 4.0:
+            rx, ry = wp.float64(zx), wp.float64(zy)
+            radius = rx*rx+ry*ry
+            refined = n
+            for _ in range(3):
+                if radius < wp.float64(1e100):
+                    next_x = rx*rx-ry*ry+cx
+                    ry = wp.float64(2)*rx*ry+cy
+                    rx = next_x
+                    radius = rx*rx+ry*ry
+                    refined += 1
+            smooth = float(wp.float64(refined+1)-wp.log(wp.float64(.5)*wp.log(radius))/wp.float64(.6931471805599453))
+        samples[b, y, x] = color(smooth)
 
 
-if __name__ == "__main__":
-    main()
+@wp.kernel(enable_backward=False)
+def fp64_fallback(views: wp.array2d(dtype=wp.float64), limits: wp.array(dtype=int), side: int, width: int,
+                  queue: wp.array(dtype=int), queue_length: wp.array(dtype=int),
+                  counts: wp.array3d(dtype=int), samples: wp.array3d(dtype=wp.vec3)):
+    index = wp.tid()
+    if index >= queue_length[0]:
+        return
+    index = queue[index]
+    x = index % counts.shape[2]
+    y = (index//counts.shape[2]) % counts.shape[1]
+    b = index//(counts.shape[2]*counts.shape[1])
+    step = views[b, 2]/wp.float64(width*side)
+    cx = views[b, 0]+(wp.float64(x)+wp.float64(.5)-wp.float64(counts.shape[2])*wp.float64(.5))*step
+    cy = views[b, 1]+(wp.float64(counts.shape[1])*wp.float64(.5)-wp.float64(y)-wp.float64(.5))*step
+    result = iterate(cx, cy, limits[b])
+    counts[b, y, x] = int(result[0])
+    samples[b, y, x] = color(result[1])
+
+
+@wp.kernel(enable_backward=False, module="unique", module_options={"fuse_fp": False})
+def tiled_reference_kernel(centers: wp.array(dtype=wp.vec4d), steps: wp.array(dtype=wp.vec2d),
+                           limits: wp.array(dtype=int), tile: int, tiles_x: int,
+                           width: int, height: int, cap: int,
+                           orbit: wp.array3d(dtype=wp.vec4d), lengths: wp.array2d(dtype=int)):
+    b, t = wp.tid()
+    center = centers[b]
+    ox = wp.float64((t % tiles_x)*tile)+wp.float64(tile)*wp.float64(.5)-wp.float64(width)*wp.float64(.5)
+    oy = wp.float64(height)*wp.float64(.5)-wp.float64((t // tiles_x)*tile)-wp.float64(tile)*wp.float64(.5)
+    cx = dd_add(wp.vec2d(center[0], center[1]), dd_mul(steps[b], wp.vec2d(ox, wp.float64(0.0))))
+    cy = dd_add(wp.vec2d(center[2], center[3]), dd_mul(steps[b], wp.vec2d(oy, wp.float64(0.0))))
+    zx, zy = wp.vec2d(0.0, 0.0), wp.vec2d(0.0, 0.0)
+    xx, yy = dd_mul(zx, zx), dd_mul(zy, zy)
+    n = int(0)
+    orbit[b, t, 0] = wp.vec4d(0.0, 0.0, 0.0, 0.0)
+    while n < wp.min(limits[b], cap) and dd_add(xx, yy)[0] < wp.float64(1e40):
+        next_x = dd_add(dd_add(xx, -yy), cx)
+        zy = dd_add(dd_mul(zx, zy)*wp.float64(2), cy)
+        zx = next_x
+        xx, yy = dd_mul(zx, zx), dd_mul(zy, zy)
+        n += 1
+        orbit[b, t, n] = wp.vec4d(zx[0], zx[1], zy[0], zy[1])
+    lengths[b, t] = n
+
+
+@wp.kernel(enable_backward=False)
+def tiled_perturbation_kernel(orbit: wp.array3d(dtype=wp.vec4d), lengths: wp.array2d(dtype=int),
+                              steps: wp.array(dtype=wp.vec2d), limits: wp.array(dtype=int),
+                              tile: int, tiles_x: int, marker: Any, strict: bool,
+                              counts: wp.array3d(dtype=int), samples: wp.array3d(dtype=wp.vec3),
+                              escape: wp.array3d(dtype=float), styled_escape: wp.array3d(dtype=float),
+                              fallbacks: wp.array(dtype=int), queue: wp.array(dtype=int), queue_length: wp.array(dtype=int), reasons: wp.array(dtype=wp.int64)):
+    b, y, x = wp.tid()
+    tx, ty = x//tile, y//tile
+    t = ty*tiles_x+tx
+    step = type(marker)(steps[b][0])
+    dcx = (type(marker)(x % tile)+type(marker)(.5)-type(marker)(tile)*type(marker)(.5))*step
+    dcy = (type(marker)(tile)*type(marker)(.5)-type(marker)(y % tile)-type(marker)(.5))*step
+    dx, dy, error = type(marker)(0.0), type(marker)(0.0), type(marker)(0.0)
+    eps, threshold = type(marker)(8e-15), type(marker)(1e-10)
+    if marker > type(marker)(0.5):
+        eps, threshold = type(marker)(1e-6), type(marker)(1e-5)
+    n = int(0)
+    failed = bool(False)
+    reason = int(0)
+    rx, ry, r2 = type(marker)(0.0), type(marker)(0.0), type(marker)(0.0)
+    while n <= limits[b]:
+        ref = orbit[b, t, n]
+        ax = type(marker)(ref[0])+type(marker)(ref[1])
+        ay = type(marker)(ref[2])+type(marker)(ref[3])
+        rx, ry = ax+dx, ay+dy
+        r2 = rx*rx+ry*ry
+        norm = wp.abs(rx)+wp.abs(ry)
+        tolerance = type(marker)(32.0)*(norm+type(marker)(1.0))*(error+eps)
+        if wp.abs(r2-type(marker)(4.0)) <= tolerance:
+            failed = True
+            reason = 0
+            break
+        if r2 < type(marker)(1e-8)*(ax*ax+ay*ay):
+            failed = True
+            reason = 1
+            break
+        if strict and error > threshold*(norm+type(marker)(1e-12)):
+            failed = True
+            reason = 2
+            break
+        if r2 > type(marker)(4.0) or n == limits[b]:
+            break
+        if n >= lengths[b, t]:
+            reason = 3
+            failed = True
+            break
+        delta_norm = wp.abs(dx)+wp.abs(dy)
+        growth = type(marker)(2.000002)*type(marker)(wp.sqrt(float(r2)))
+        error = (growth+type(marker)(2.0)*error)*error + eps*(
+            type(marker)(2.0)*(wp.abs(ax)+wp.abs(ay))*delta_norm+delta_norm*delta_norm+wp.abs(dcx)+wp.abs(dcy))
+        next_dx = type(marker)(2.0)*(ax*dx-ay*dy)+dx*dx-dy*dy+dcx
+        next_dy = type(marker)(2.0)*(ax*dy+ay*dx+dx*dy)+dcy
+        dx, dy = next_dx, next_dy
+        n += 1
+    counts[b, y, x] = n
+    if failed:
+        wp.atomic_add(reasons,reason,wp.int64(1))
+        wp.atomic_add(reasons,4,wp.int64(n))
+        counts[b, y, x] = -n-1
+        wp.atomic_add(fallbacks, b, 1)
+        index = wp.atomic_add(queue_length, 0, 1)
+        queue[index] = (b*counts.shape[1]+y)*counts.shape[2]+x
+    else:
+        smooth = float(-1.0)
+        styled = float(-1.0)
+        if r2 > type(marker)(4.0):
+            # Once escaped, orbit continuation for smooth coloring can use
+            # ordinary double coordinates. The deep offset is negligible here.
+            ref = orbit[b, t, 1]
+            cx, cy = ref[0]+ref[1]+wp.float64(dcx), ref[2]+ref[3]+wp.float64(dcy)
+            styled = float(wp.float64(n-1)+wp.log(wp.float64(2.0))/(wp.float64(.5)*wp.log(wp.float64(r2)))+wp.float64(.5)*wp.sqrt(cx*cx+cy*cy))
+            zx, zy = wp.float64(rx), wp.float64(ry)
+            radius = zx*zx+zy*zy
+            refined = n
+            for _ in range(3):
+                if radius < wp.float64(1e100):
+                    next_x = zx*zx-zy*zy+cx
+                    zy = wp.float64(2.0)*zx*zy+cy
+                    zx = next_x
+                    radius = zx*zx+zy*zy
+                    refined += 1
+            smooth = float(wp.float64(refined+1)-wp.log(wp.float64(.5)*wp.log(radius))/wp.float64(.6931471805599453))
+        samples[b, y, x] = color(smooth)
+        escape[b,y,x] = smooth
+        styled_escape[b,y,x] = styled
+
+
+@wp.kernel(enable_backward=False, module="unique", module_options={"fuse_fp": False})
+def batched_dd_fallback(centers: wp.array(dtype=wp.vec4d), steps: wp.array(dtype=wp.vec2d),
+                        limits: wp.array(dtype=int), queue: wp.array(dtype=int), queue_length: wp.array(dtype=int),
+                        compact: bool, counts: wp.array3d(dtype=int),
+                        samples: wp.array3d(dtype=wp.vec3), escape: wp.array3d(dtype=float),
+                        styled_escape: wp.array3d(dtype=float)):
+    index = wp.tid()
+    if compact:
+        if index >= queue_length[0]:
+            return
+        index = queue[index]
+    x = index % counts.shape[2]
+    y = (index // counts.shape[2]) % counts.shape[1]
+    b = index // (counts.shape[2]*counts.shape[1])
+    if counts[b, y, x] >= 0:
+        return
+    center = centers[b]
+    ox = wp.float64(x)+wp.float64(.5)-wp.float64(counts.shape[2])*wp.float64(.5)
+    oy = wp.float64(counts.shape[1])*wp.float64(.5)-wp.float64(y)-wp.float64(.5)
+    cx = dd_add(wp.vec2d(center[0], center[1]), dd_mul(steps[b], wp.vec2d(ox, wp.float64(0.0))))
+    cy = dd_add(wp.vec2d(center[2], center[3]), dd_mul(steps[b], wp.vec2d(oy, wp.float64(0.0))))
+    zx, zy = wp.vec2d(0.0, 0.0), wp.vec2d(0.0, 0.0)
+    xx, yy = dd_mul(zx, zx), dd_mul(zy, zy)
+    radius = dd_add(xx, yy)
+    n = int(0)
+    while n < limits[b]:
+        if radius[0] > wp.float64(4.0) or (radius[0] == wp.float64(4.0) and radius[1] > wp.float64(0.0)):
+            break
+        next_x = dd_add(dd_add(xx, -yy), cx)
+        zy = dd_add(dd_mul(zx, zy)*wp.float64(2.0), cy)
+        zx = next_x
+        xx, yy = dd_mul(zx, zx), dd_mul(zy, zy)
+        radius = dd_add(xx, yy)
+        n += 1
+    counts[b, y, x] = n
+    smooth = float(-1.0)
+    styled = float(-1.0)
+    if radius[0] > wp.float64(4.0) or (radius[0] == wp.float64(4.0) and radius[1] > wp.float64(0.0)):
+        rx, ry = zx[0]+zx[1], zy[0]+zy[1]
+        r2 = rx*rx+ry*ry
+        styled = float(wp.float64(n-1)+wp.log(wp.float64(2.0))/(wp.float64(.5)*wp.log(r2))+wp.float64(.5)*wp.sqrt(cx[0]*cx[0]+cy[0]*cy[0]))
+        refined = n
+        for _ in range(3):
+            if r2 < wp.float64(1e100):
+                next_rx = rx*rx-ry*ry+cx[0]
+                ry = wp.float64(2.0)*rx*ry+cy[0]
+                rx = next_rx
+                r2 = rx*rx+ry*ry
+                refined += 1
+        smooth = float(wp.float64(refined+1)-wp.log(wp.float64(.5)*wp.log(r2))/wp.float64(.6931471805599453))
+    samples[b, y, x] = color(smooth)
+    escape[b,y,x] = smooth
+    styled_escape[b,y,x] = styled
+
+
+class DatasetRenderer:
+    """Select a measured backend per scale; check every batch against FP64.
+
+    Comparisons are finite-budget numerical checks, not fractal convergence
+    proofs. Selection includes allocation and device-to-host image transfer.
+    """
+
+    def __init__(self, side=2, mode="auto", palette="cosine"):
+        if palette not in ('cosine', 'smooth') or (palette == 'smooth' and mode == 'hybrid32'):
+            raise ValueError("Smooth coloring requires a backend with escape samples")
+        self.palette = palette
+        self.side, self.mode = side, mode
+        self.selected = {}
+        self.report = {"selection": {}, "checks": [], "render_seconds": 0.,
+                       "calibration_seconds": 0., "rgb_mae_limit": .0005,
+                       "count_mismatch_limit": .001}
+
+    @staticmethod
+    def bucket(view):
+        import math
+        return round(math.log(3.5 / view.span, 4))
+
+    def _make(self, views, mode):
+        return FastRenderer(views, side=self.side, precision=mode, tile=64, guard="bailout")
+
+    def _render(self, renderer):
+        image = renderer.render()
+        if self.palette == 'smooth':
+            table = torch.tensor([[0,7,80],[20,70,180],[80,170,230],[235,250,255],
+                                  [255,185,45],[130,45,10],[0,7,80]], device=renderer.escape.device)/255
+            image = renderer.recolor(table, (renderer.escape.clamp_min(0).log1p()*.7).remainder(1))
+        return image
+
+    def _difference(self, renderer, expected_images, expected_counts):
+        delta = (renderer.image - expected_images).abs().flatten(1)
+        mismatch = (renderer.counts != expected_counts).flatten(1).float().mean(1)
+        return {"rgb_mae": delta.mean(1).max().item(), "rgb_max": delta.max().item(),
+                "count_mismatch_fraction": mismatch.max().item()}
+
+    def _acceptable(self, error):
+        return error["rgb_mae"] <= self.report["rgb_mae_limit"] and error["count_mismatch_fraction"] <= self.report["count_mismatch_limit"]
+
+    def calibrate(self, views):
+        import time
+        import statistics
+        started = time.perf_counter()
+        groups = {}
+        for view in views:
+            groups.setdefault(self.bucket(view), []).append(view)
+        for key, entries in sorted(groups.items()):
+            # Spread checks across selected locations, parents and targets.
+            entries = [entries[i] for i in torch.linspace(0, len(entries)-1, min(8, len(entries))).long().tolist()]
+            reference = self._make(entries, "float64")
+            expected_images = self._render(reference).clone()
+            expected_counts = reference.counts.clone()
+            del reference
+            candidates = []
+            modes = ("float64", "hybrid32", "perturb32", "perturb64") if self.mode == "auto" else tuple(dict.fromkeys(("float64", self.mode)))
+            if self.palette == 'smooth':
+                modes = tuple(m for m in modes if m != 'hybrid32')
+            for mode in modes:
+                renderer = self._make(entries, mode)
+                self._render(renderer)
+                error = self._difference(renderer, expected_images, expected_counts)
+                del renderer
+                times = []
+                for _ in range(3):
+                    torch.cuda.synchronize()
+                    before = time.perf_counter()
+                    renderer = self._make(entries, mode)
+                    cpu = self._render(renderer).cpu()
+                    times.append(time.perf_counter() - before)
+                    del renderer, cpu
+                candidates.append({"mode": mode, "seconds": statistics.median(times),
+                                   "accepted": self._acceptable(error), **error})
+            accepted = [r for r in candidates if r["accepted"] and (self.mode == "auto" or r["mode"] == self.mode)]
+            chosen = min(accepted, key=lambda r: r["seconds"])["mode"] if accepted else "float64"
+            self.selected[key] = chosen
+            self.report["selection"][str(key)] = {"mode": chosen, "checked_views": len(entries), "candidates": candidates}
+            print(f"Scale {key}: selected {chosen}", flush=True)
+        self.report["calibration_seconds"] = time.perf_counter() - started
+
+    def render(self, views):
+        import time
+        started = time.perf_counter()
+        output = torch.empty((len(views), 128, 128, 3))
+        used = [None] * len(views)
+        groups = {}
+        for i, view in enumerate(views):
+            groups.setdefault(self.selected[self.bucket(view)], []).append(i)
+        for mode, indices in groups.items():
+            key = sorted({self.bucket(views[i]) for i in indices})
+            renderer = self._make([views[i] for i in indices], mode)
+            self._render(renderer)
+            if mode != "float64":
+                # A rotating representative checks every production batch.
+                check = len(self.report["checks"]) % len(indices)
+                ref = self._make([views[indices[check]]], "float64")
+                expected = self._render(ref)
+                delta = (renderer.image[check:check+1]-expected).abs()
+                error = {"rgb_mae": delta.mean().item(), "rgb_max": delta.max().item(),
+                         "count_mismatch_fraction": (renderer.counts[check:check+1] != ref.counts).float().mean().item()}
+                accepted = self._acceptable(error)
+                self.report["checks"].append({"scale": key, "mode": mode, "accepted": accepted, **error})
+                del ref
+                if not accepted:
+                    del renderer
+                    mode = "float64"
+                    renderer = self._make([views[i] for i in indices], mode)
+                    self._render(renderer)
+            output[indices] = renderer.image.cpu()
+            for i in indices:
+                used[i] = mode
+            del renderer
+        self.report["render_seconds"] += time.perf_counter() - started
+        return output, used
