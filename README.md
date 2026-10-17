@@ -1,32 +1,18 @@
-# mandelbrot-diffusion
+# Mandelbrot explorer
 
-A small pixel-space JiT that learns 4× Mandelbrot zooms with rectified flow.
-It predicts clean RGB from noise, an upsampled crop, and a coverage mask.
+[Open the viewer](https://andredalbosco.github.io/mandelbrot-diffusion/).
 
-![Mandelbrot dataset examples](assets/dataset.png)
-
-**Input → prediction → target** (10M model, 50-step Heun):
-
-![Learned 4× zooms](assets/zoom.png)
+Click **Load model**, then click the image to zoom 4×. Inference runs locally
+with tinygrad/WebGPU: 10M parameters, 5-step Heun, 128×128 RGB.
+Only the initial view is rendered; subsequent zooms use the model’s own output.
 
 ```sh
-uv sync
-uv run python data/prepare.py --output data/zoom4x --count 10000 --shard-size 1000 --overviews 10
-uv run python train.py --config config/small.py
-uv run python sample.py runs/small/checkpoint.pt --input data/zoom4x/shard-0000/val.pt
+python3 -m http.server 8767
 ```
 
-Use `config/medium.py` for 10M parameters. Omit `--input` for unconditional
-sampling. Resume with `train.py --resume runs/small --additional-steps 10000`.
-CUDA required; 128×128 targets, four render samples per pixel, 10% unconditional
-training examples. Existing checkpoints remain compatible.
+Open http://localhost:8767 in a WebGPU-capable browser.
+The included EMA weights (step 220079) are in `assets/weights.safetensors`.
+Training lives on `main`; experiments and the exporter live on `research`.
+Generated patterns may drift or lose structure under repeated zooms.
 
-Repeated generated zooms can lose structure; this is an experimental learned
-approximation. `research` preserves experiments; `web` adds the browser explorer.
-
-References: [JiT](https://arxiv.org/abs/2511.13720),
-[Rectified Flow](https://arxiv.org/abs/2209.03003),
-[nanoGPT](https://github.com/karpathy/nanoGPT).
-JiT attribution: [LICENSE-JiT](LICENSE-JiT).
-
-Browser explorer: [web/](web/README.md), using tinygrad and local WebGPU.
+[tinygrad](https://github.com/tinygrad/tinygrad) · [JiT](https://arxiv.org/abs/2511.13720)
