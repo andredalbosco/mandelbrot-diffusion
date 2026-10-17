@@ -28,3 +28,5 @@ References: [JiT](https://arxiv.org/abs/2511.13720),
 [Rectified Flow](https://arxiv.org/abs/2209.03003),
 [nanoGPT](https://github.com/karpathy/nanoGPT).
 JiT attribution: [LICENSE-JiT](LICENSE-JiT).
+
+Browser explorer: [web/](web/README.md), using tinygrad and local WebGPU.

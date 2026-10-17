@@ -1,0 +1,15 @@
+{
+  "step": 220079,
+  "parameters": 10009792,
+  "max_abs_error": 2.86102294921875e-06,
+  "inputs": {
+    "input0": 196608,
+    "input1": 4,
+    "input2": 196608,
+    "input3": 65536
+  },
+  "outputs": {
+    "output0": 196608
+  },
+  "checkpoint_sha256": "2bda79a0c3bae8ecd76d17680acebef5fc7bb139e458caece92ec212b9062c0d"
+}
