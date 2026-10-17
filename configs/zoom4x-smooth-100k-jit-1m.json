@@ -1,0 +1,31 @@
+{
+  "formulation": "conditional-jit-x-pred",
+  "architecture": "jit",
+  "model": {
+    "channels": 3,
+    "mask_channels": 1,
+    "patch_size": 8,
+    "hidden_size": 128,
+    "depth": 3,
+    "num_heads": 4,
+    "bottleneck_dim": 64,
+    "mlp_ratio": 4.0
+  },
+  "data": "data/zoom4x-smooth-blue-gold-100k-128",
+  "output": "runs/jit-1m-smooth-100k",
+  "device": "cuda",
+  "size": 128,
+  "batch_size": 64,
+  "learning_rate": 0.0002,
+  "ema_decay": 0.999,
+  "steps": 20000,
+  "eval_every": 500,
+  "checkpoint_every": 500,
+  "warmup_steps": 500,
+  "seed": 20261016,
+  "flow": {
+    "time_mean": -0.8,
+    "time_std": 0.8,
+    "minimum_remaining": 0.05
+  }
+}

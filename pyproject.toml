@@ -1,0 +1,28 @@
+[project]
+name = "mandelbrot-diffusion"
+version = "0.1.0"
+description = "Mandelbrot images generated with Warp into PyTorch tensors"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.7",
+    "warp-lang>=1.9",
+    "matplotlib>=3.9",
+    "pyside6>=6.8",
+    "pyglet>=2.1.19",
+    "imgui[pyglet]>=2.0.0",
+]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[dependency-groups]
+notebooks = [
+    "ipywidgets>=8.1",
+    "jupyterlab>=4.6.4",
+    "nbclient>=0.11.0",
+]

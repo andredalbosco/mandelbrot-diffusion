@@ -1,0 +1,49 @@
+{
+  "formulation": "conditional-jit-x-pred",
+  "architecture": "jit",
+  "model": {
+    "channels": 3,
+    "mask_channels": 1,
+    "patch_size": 8,
+    "hidden_size": 128,
+    "depth": 3,
+    "num_heads": 4,
+    "bottleneck_dim": 64,
+    "mlp_ratio": 4.0,
+    "mlp_hidden_size": 352
+  },
+  "data": "data/zoom4x-smooth-blue-gold-1m-128-patch32",
+  "output": "runs/jit-1m-smooth-1m-patch32",
+  "device": "cuda",
+  "size": 128,
+  "batch_size": 64,
+  "learning_rate": 0.0002,
+  "ema_decay": 0.999,
+  "steps": 100000,
+  "eval_every": 500,
+  "checkpoint_every": 500,
+  "warmup_steps": 500,
+  "seed": 20261016,
+  "flow": {
+    "time_mean": -0.8,
+    "time_std": 0.8,
+    "minimum_remaining": 0.05
+  },
+  "compile": true,
+  "log_every": 50,
+  "betas": [
+    0.9,
+    0.999
+  ],
+  "weight_decay": 0.01,
+  "compile_mode": "reduce-overhead",
+  "unconditional_fraction": 0.1,
+  "stratify_depth": true,
+  "quality_steps": [
+    10000,
+    25000,
+    50000,
+    100000
+  ],
+  "quality_output": "output/dataset-browser/training-experiments"
+}

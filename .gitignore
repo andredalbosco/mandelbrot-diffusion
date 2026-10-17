@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+data/
+runs/
+
+.playwright-cli/
+web/assets/weights.safetensors
