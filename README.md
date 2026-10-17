@@ -2,7 +2,7 @@
 
 [Open the viewer](https://andredalbosco.github.io/mandelbrot-diffusion/).
 
-Click **Load model**, then click the image to zoom 4×. Inference runs locally
+Click the image to zoom 4×. The first click loads the model automatically, then completes your zoom. Inference runs locally
 with tinygrad/WebGPU: 10M parameters, 5-step Heun, 128×128 RGB.
 Only the initial view is rendered; subsequent zooms use the model’s own output.
 
