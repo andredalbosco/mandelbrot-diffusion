@@ -101,3 +101,11 @@ implement the learning experiments. Generated data and results live in ignored
 - [PBRT: Image Reconstruction](https://pbr-book.org/4ed/Sampling_and_Reconstruction/Image_Reconstruction): sampling and reconstruction filters.
 
 [Reference notes](docs/references.md)
+
+## Eight-hour continuation
+
+The [recursive zoom comparison](docs/zoom-comparison-8h.md) records the later
+10M-model continuation, selected before/after images and complete saved metrics.
+The configuration and launcher are in `configs/zoom4x-smooth-1m-jit-10m-8h.json`
+and `scripts/train_8h.sh`. Checkpoints, datasets and browser model weights remain
+local; the launcher requires the existing pilot run.
