@@ -20,3 +20,11 @@ References: [JiT](https://arxiv.org/abs/2511.13720),
 [Rectified Flow](https://arxiv.org/abs/2209.03003),
 [nanoGPT](https://github.com/karpathy/nanoGPT).
 JiT attribution: [LICENSE-JiT](LICENSE-JiT).
+
+## Research implementation
+
+The [research branch](https://github.com/andredalbosco/mandelbrot-diffusion/tree/research)
+contains the interactive CUDA renderer, recursive WebGPU explorer, model experiments
+and [eight-hour continuation comparison](https://github.com/andredalbosco/mandelbrot-diffusion/blob/research/docs/zoom-comparison-8h.md).
+This branch keeps the focused training pipeline. Datasets, checkpoints and model
+weights are not included in Git.
